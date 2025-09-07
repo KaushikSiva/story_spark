@@ -10,6 +10,7 @@ import requests
 from pathlib import Path
 from PIL import Image
 import uuid
+import mimetypes
 
 
 load_dotenv()
@@ -43,6 +44,7 @@ def create_app() -> Flask:
         OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
         IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
         FALLBACK_IMAGE_MODEL=os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview"),
+        PEOPLE_DIR=os.environ.get("PEOPLE_DIR", "static/people"),
     )
 
     # Ensure output path exists
@@ -122,12 +124,20 @@ def create_app() -> Flask:
                 n = max(1, min(12, n))
             except Exception:
                 n = 8
+            # Character reference handling: derive from generated JSON only
+            character_target = int(payload.get("num_characters", 1) or 1)
+            reference_parts = load_reference_image_parts(
+                people_dir=app.config["PEOPLE_DIR"],
+                k=character_target + 4,
+            )
             try:
                 files = generate_images_from_synopsis(
                     synopsis=payload["synopsis"],
                     model_name=app.config["IMAGE_STORY_MODEL"],
                     out_dir=app.config["OUTPUT_DIR"],
                     n=n,
+                    reference_parts=reference_parts,
+                    character_target=character_target,
                 )
                 base_url = request.url_root.rstrip("/")
                 payload["images"] = [
@@ -152,6 +162,8 @@ def create_app() -> Flask:
                     director="Bruno",
                     model_name=app.config["IMAGE_STORY_MODEL"],
                     out_dir=app.config["OUTPUT_DIR"],
+                    reference_parts=reference_parts,
+                    character_target=character_target,
                 )
                 if poster_file:
                     payload["poster_image"] = {
@@ -448,18 +460,24 @@ def _fallback_poster(*, title: str | None, genre: str | None, synopsis: str | No
     }
 
 
-def build_images_prompt_from_synopsis(synopsis: str, n: int) -> str:
+def build_images_prompt_from_synopsis(synopsis: str, n: int, *, character_target: int | None) -> str:
     n = max(1, n)
+    ct = int(character_target) if character_target is not None else None
+    ref_note = (
+        f"You may be given up to {ct + 4 if ct is not None else 8} candidate human reference photos from a 'people' folder. "
+        f"If any match the story's characters, use whichever {ct if ct is not None else 'few'} are most suitable. "
+        f"If characters are non-human or no references fit, ignore them and invent consistent characters. "
+    )
     return (
-        f"Create a beautifully entertaining {n} part story with {n} images inspired by the following movie synopsis. "
+        f"Create a beautifully entertaining {n} part story with {n} narrative beats inspired by the following movie synopsis. "
         f"Tell the story purely through imagery with no words or text on the images. "
-        f"Keep characters, setting, and styling consistent across all {n} images.\n\n"
+        f"Keep characters, setting, and styling consistent across all parts. {ref_note}\n\n"
         f"Synopsis:\n{synopsis.strip()}\n\n"
-        f"Output: 1 distinct image, stitching together {n} parts."
+        f"Output: Create a single, coherent image that visually stitches together all {n} parts into one cinematic collage."
     )
 
 
-def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: str, n: int = 8) -> list[str]:
+def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: str, n: int = 8, reference_parts: list | None = None, character_target: int | None = None) -> list[str]:
     if not _GENAI_AVAILABLE:
         raise RuntimeError("google-genai is not installed")
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -469,10 +487,11 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     client = genai.Client(api_key=api_key)
     cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
 
-    prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n)
+    prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n, character_target=character_target)
 
     def _call(model: str):
-        return client.models.generate_content(model=model, contents=prompt, config=cfg)
+        contents = (list(reference_parts) + [prompt]) if reference_parts else prompt
+        return client.models.generate_content(model=model, contents=contents, config=cfg)
 
     response = None
     try:
@@ -503,11 +522,13 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
                 f"Beat: {ln}"
             )
             try:
-                r = client.models.generate_content(model=model_name, contents=single_prompt, config=cfg)
+                contents = (list(reference_parts) + [single_prompt]) if reference_parts else single_prompt
+                r = client.models.generate_content(model=model_name, contents=contents, config=cfg)
             except Exception:
                 # fallback once
                 fb = os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview")
-                r = client.models.generate_content(model=fb, contents=single_prompt, config=cfg)
+                contents = (list(reference_parts) + [single_prompt]) if reference_parts else single_prompt
+                r = client.models.generate_content(model=fb, contents=contents, config=cfg)
             more = _extract_images_from_genai_response(r)
             if more:
                 saved.extend(_save_images_parts(more[:1], out_dir))
@@ -517,11 +538,13 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     return saved[:n]
 
 
-def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno") -> str:
+def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno", *, character_target: int | None = None) -> str:
     return (
         f"Design a cinematic FIRST LOOK MOVIE POSTER for the film titled '{title}'. "
         f"Director credit: Directed by {director}. "
         f"Use the following synopsis to guide the imagery, characters, tone, and setting. "
+        f"If candidate human reference photos are provided, choose whichever best match up to {character_target if character_target is not None else 4} characters; "
+        f"if characters are non-human or references do not fit, ignore them and invent consistent characters. "
         f"Include tasteful, legible on-poster text: the film title '{title}', the credit 'Directed by {director}', and 2–4 thematically appropriate character names you invent (avoid real IP). "
         f"Style: high fidelity, cohesive layout, strong typography, filmic color grading, premium key-art quality. "
         f"Avoid watermarks or logos.\n\n"
@@ -529,7 +552,7 @@ def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno") -> s
     )
 
 
-def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, model_name: str, out_dir: str) -> str | None:
+def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, model_name: str, out_dir: str, reference_parts: list | None = None, character_target: int | None = None) -> str | None:
     if not _GENAI_AVAILABLE:
         return None
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -539,10 +562,11 @@ def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, m
     client = genai.Client(api_key=api_key)
     cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
 
-    prompt = build_poster_prompt(title, _enforce_synopsis_lines(synopsis, genre=None), director)
+    prompt = build_poster_prompt(title, _enforce_synopsis_lines(synopsis, genre=None), director, character_target=character_target)
 
     def _call(model: str):
-        return client.models.generate_content(model=model, contents=prompt, config=cfg)
+        contents = (list(reference_parts) + [prompt]) if reference_parts else prompt
+        return client.models.generate_content(model=model, contents=contents, config=cfg)
 
     try:
         response = _call(model_name)
@@ -553,11 +577,50 @@ def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, m
         except Exception:
             return None
 
+    # response handled in try/except above
+
     parts = _extract_images_from_genai_response(response)
     if not parts:
         return None
     saved = _save_images_parts(parts[:1], out_dir)
     return saved[0] if saved else None
+
+
+def load_reference_image_parts(*, people_dir: str, k: int) -> list:
+    # Collect candidate image file paths
+    try:
+        p = Path(people_dir)
+        if not p.exists() or not p.is_dir():
+            return []
+        all_files = [
+            f for f in p.iterdir()
+            if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ]
+        if not all_files:
+            return []
+        import random as _rnd
+        chosen = _rnd.sample(all_files, k=min(len(all_files), max(1, int(k))))
+        try:
+            logging.getLogger(__name__).info(
+                "gemini reference images=%s", [str(f) for f in chosen]
+            )
+        except Exception:
+            pass
+        parts = []
+        for f in chosen:
+            try:
+                data = f.read_bytes()
+                mime = mimetypes.guess_type(f.name)[0] or ("image/png" if f.suffix.lower() == ".png" else "image/jpeg")
+                if genai_types and hasattr(genai_types, "Part") and hasattr(genai_types.Part, "from_bytes"):
+                    parts.append(genai_types.Part.from_bytes(data=data, mime_type=mime))
+                else:
+                    import base64
+                    parts.append({"inline_data": {"data": base64.b64encode(data).decode("ascii"), "mime_type": mime}})
+            except Exception:
+                continue
+        return parts
+    except Exception:
+        return []
 
 
 def _extract_images_from_genai_response(response):
