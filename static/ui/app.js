@@ -150,6 +150,9 @@ async function handleSubmit(e) {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  if (typeof initTabs === 'function') initTabs();
+  initTheme();
+  initBrand();
   $("#gen-form").addEventListener("submit", handleSubmit);
   const btnVideo = document.getElementById("btn-video");
   if (btnVideo) btnVideo.addEventListener("click", handleGenerateVideo);
@@ -175,6 +178,7 @@ window.addEventListener("DOMContentLoaded", () => {
       result.classList.remove('hidden');
       // Restore teaser player if previously generated
       if (data.teaser) {
+        if (window.__setActiveTab) window.__setActiveTab('create');
         const out = document.getElementById('video-out');
         if (out) {
           renderVideo(out, { url: data.teaser, duration: 8 });
@@ -409,6 +413,60 @@ function handleClear() {
   if (btnResync) btnResync.disabled = true;
 }
 
+function initTabs() {
+  const links = $$('.tab-link');
+  const panels = $$('.tab-panel');
+  const setActive = (name) => {
+    links.forEach(l => l.classList.toggle('active', l.dataset.tab === name));
+    panels.forEach(p => p.classList.toggle('active', p.id === `tab-${name}`));
+    try { localStorage.setItem('active_tab', name); } catch {}
+    if (name) { try { history.replaceState(null, '', `#${name}`); } catch {} }
+  };
+  links.forEach(l => l.addEventListener('click', () => setActive(l.dataset.tab)));
+  const hash = (location.hash || '').replace('#','');
+  const saved = (() => { try { return localStorage.getItem('active_tab') || ''; } catch { return ''; } })();
+  const map = (v) => (v === 'teaser' ? 'create' : v);
+  const allowed = ['create','post','youtube'];
+  const initialHash = map(hash);
+  const initialSaved = map(saved);
+  const initial = allowed.includes(initialHash) ? initialHash : (allowed.includes(initialSaved) ? initialSaved : 'create');
+  setActive(initial);
+  window.__setActiveTab = setActive;
+}
+
+function initTheme() {
+  const toggle = document.getElementById('theme-toggle');
+  const apply = (mode) => {
+    document.body.classList.toggle('theme-light', mode === 'light');
+    try { localStorage.setItem('theme', mode); } catch {}
+    if (toggle) toggle.textContent = mode === 'light' ? 'Dark Mode' : 'Light Mode';
+  };
+  let mode = (() => { try { return localStorage.getItem('theme'); } catch { return null; } })();
+  if (!mode) {
+    try { mode = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'; } catch { mode = 'dark'; }
+  }
+  apply(mode === 'light' ? 'light' : 'dark');
+  if (toggle) toggle.addEventListener('click', () => {
+    const next = document.body.classList.contains('theme-light') ? 'dark' : 'light';
+    apply(next);
+  });
+}
+
+function initBrand() {
+  const applyAccent = (hex) => {
+    document.documentElement.style.setProperty('--accent', hex);
+    try { localStorage.setItem('accent', hex); } catch {}
+  };
+  const saved = (() => { try { return localStorage.getItem('accent'); } catch { return null; } })();
+  if (saved) applyAccent(saved);
+  $$('.swatch').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const v = btn.getAttribute('data-accent');
+      if (v) applyAccent(v);
+    });
+  });
+}
+
 async function handleYouTubeFileUpload() {
   const status = document.getElementById('yt-file-status');
   const fileInput = document.getElementById('yt-upload-file');
@@ -461,6 +519,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     // Clear flag early to avoid loops
     localStorage.removeItem('yt_pending');
     if (pending && pending.type === 'teaser' && pending.payload) {
+      if (window.__setActiveTab) window.__setActiveTab('create');
       const status = document.getElementById('yt-status');
       if (status) status.textContent = 'Authorized. Uploading teaser to YouTube…';
       try {
