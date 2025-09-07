@@ -159,6 +159,8 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnClear) btnClear.addEventListener("click", handleClear);
   const btnUpload = document.getElementById("btn-upload-process");
   if (btnUpload) btnUpload.addEventListener("click", handleUploadProcess);
+  const btnYtUpload = document.getElementById('btn-yt-upload-file');
+  if (btnYtUpload) btnYtUpload.addEventListener('click', handleYouTubeFileUpload);
   const folderEl = document.getElementById('upload-folder');
   const titleEl = document.querySelector('#gen-form input[name="title"]');
   if (folderEl) folderEl.addEventListener('input', updateUploadPreview);
@@ -242,6 +244,7 @@ function renderVideo(container, data) {
   const prompt = data.prompt || "";
   const model = data.model || "";
   const dur = data.duration || data.duration_seconds || "";
+  const localFile = data.local_file || '';
   container.innerHTML = `
     <div class="video-wrap">
       ${url ? `<video controls src="${encodeURI(url)}"></video>` : "<div class=muted>No local video file created</div>"}
@@ -251,7 +254,56 @@ function renderVideo(container, data) {
       ${dur ? `<span class="pill">${dur}s</span>` : ""}
       ${model ? `<span class="pill alt">${escapeHtml(model)}</span>` : ""}
     </div>
+    <div class="actions" style="margin-top: 12px;">
+      <button id="btn-upload-youtube" class="secondary">Upload to YouTube</button>
+      <span id="yt-status" class="small"></span>
+    </div>
   `;
+  const btn = document.getElementById('btn-upload-youtube');
+  if (btn) btn.addEventListener('click', () => uploadToYouTube({ url, local_file: localFile }));
+}
+
+async function uploadToYouTube(info) {
+  const status = document.getElementById('yt-status');
+  if (status) status.textContent = '';
+  // Compose metadata from current form / last result
+  const form = document.getElementById('gen-form');
+  let title = (form && form.title && form.title.value.trim()) || '';
+  let description = '';
+  try { description = (LAST_RESULT && LAST_RESULT.synopsis) ? LAST_RESULT.synopsis : ''; } catch {}
+  const payload = {
+    url: info && info.url || '',
+    local_file: info && info.local_file || '',
+    title: title || 'Story Spark Teaser',
+    description: description || 'Created with Story Spark',
+    privacyStatus: 'unlisted',
+  };
+  // Check server-side YouTube auth first (after we have payload so we can resume)
+  try {
+    const check = await fetch('/api/youtube/status');
+    const js = await check.json();
+    if (!js.authorized) {
+      try { localStorage.setItem('yt_pending', JSON.stringify({ type: 'teaser', payload })); } catch {}
+      if (status) status.textContent = 'Redirecting to YouTube to authorize…';
+      window.location.href = '/api/youtube/auth';
+      return;
+    }
+  } catch {}
+  if (status) status.textContent = 'Uploading to YouTube…';
+  try {
+    const res = await fetch('/api/upload_youtube', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    const link = data.link || (data.video && data.video.id ? `https://youtu.be/${data.video.id}` : '');
+    if (status) status.innerHTML = link ? `Uploaded: <a href="${encodeURI(link)}" target="_blank" rel="noopener">${escapeHtml(link)}</a>` : 'Uploaded';
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = `Upload failed: ${e.message || e}`;
+  }
 }
 
 async function handleUploadProcess() {
@@ -348,6 +400,82 @@ function handleClear() {
   const btnResync = document.getElementById('btn-resync');
   if (btnResync) btnResync.disabled = true;
 }
+
+async function handleYouTubeFileUpload() {
+  const status = document.getElementById('yt-file-status');
+  const fileInput = document.getElementById('yt-upload-file');
+  const titleEl = document.getElementById('yt-upload-title');
+  const descEl = document.getElementById('yt-upload-desc');
+  const privEl = document.getElementById('yt-upload-privacy');
+  if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+    if (status) status.textContent = 'Choose a video file first';
+    return;
+  }
+  // Check auth
+  try {
+    const check = await fetch('/api/youtube/status');
+    const js = await check.json();
+    if (!js.authorized) {
+      if (status) status.textContent = 'Redirecting to YouTube to authorize… (reselect file after)';
+      try { localStorage.setItem('yt_pending', JSON.stringify({ type: 'file' })); } catch {}
+      window.location.href = '/api/youtube/auth';
+      return;
+    }
+  } catch {}
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  if (titleEl && titleEl.value.trim()) fd.append('title', titleEl.value.trim());
+  if (descEl && descEl.value.trim()) fd.append('description', descEl.value.trim());
+  if (privEl && privEl.value) fd.append('privacyStatus', privEl.value);
+  if (status) status.textContent = 'Uploading…';
+  try {
+    const res = await fetch('/api/upload_youtube_file', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    const link = data.link || (data.video && data.video.id ? `https://youtu.be/${data.video.id}` : '');
+    if (status) status.innerHTML = link ? `Uploaded: <a href="${encodeURI(link)}" target="_blank" rel="noopener">${escapeHtml(link)}</a>` : 'Uploaded';
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = `Upload failed: ${e.message || e}`;
+  }
+}
+
+// Auto-resume pending actions after returning from YouTube OAuth
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const raw = localStorage.getItem('yt_pending');
+    if (!raw) return;
+    const pending = JSON.parse(raw);
+    // Check if we are authorized now
+    const resp = await fetch('/api/youtube/status');
+    const js = await resp.json();
+    if (!js.authorized) return; // still not authorized
+    // Clear flag early to avoid loops
+    localStorage.removeItem('yt_pending');
+    if (pending && pending.type === 'teaser' && pending.payload) {
+      const status = document.getElementById('yt-status');
+      if (status) status.textContent = 'Authorized. Uploading teaser to YouTube…';
+      try {
+        const res = await fetch('/api/upload_youtube', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(pending.payload),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+        const link = data.link || (data.video && data.video.id ? `https://youtu.be/${data.video.id}` : '');
+        if (status) status.innerHTML = link ? `Uploaded: <a href="${encodeURI(link)}" target="_blank" rel="noopener">${escapeHtml(link)}</a>` : 'Uploaded';
+      } catch (e) {
+        console.error(e);
+        const status = document.getElementById('yt-status');
+        if (status) status.textContent = `Upload failed: ${e.message || e}`;
+      }
+    } else if (pending && pending.type === 'file') {
+      const s = document.getElementById('yt-file-status');
+      if (s) s.textContent = 'Authorized. Please reselect your file and click Upload again.';
+    }
+  } catch {}
+});
 
 async function handleResyncWithPoster() {
   const btn = document.getElementById("btn-resync");

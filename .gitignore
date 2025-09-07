@@ -11,3 +11,4 @@ node_modules/
 static/ui/story_book/dist/
 .DS_Store
 .vscode/
+.tokens/

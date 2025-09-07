@@ -67,7 +67,7 @@ python storybook.py
 
 - GET `/api/video_teaser`
   - Purpose: Generate an 8s teaser via FAL.ai Veo3.
-  - Enable: run `python movie.py --model veo` or set `ENABLE_VEO=1`.
+  - Enable: video features are enabled by default; set `ENABLE_VEO=0` to disable.
   - Query: `title`, `synopsis`, `stitched_image_url`, `run_dir` (all optional; inferred when possible)
   - Response: `{ url, local_file, postprocessed, stitched_image_url }`
 
@@ -76,6 +76,14 @@ python storybook.py
   - Form fields: `file` (required), `title` (optional), `run_dir` (optional)
   - Response: `{ url, local_file, run_dir, postprocessed }`
 
+- Upload to YouTube
+  - UI: In the Movie UI, use the “Upload a Local Video to YouTube” section to select a file and upload to your channel. First-time use redirects you to authorize YouTube.
+  - Backend endpoints:
+    - GET `/api/youtube/status` — returns `{ authorized: true|false }`
+    - GET `/api/youtube/auth` — starts OAuth (scope: `youtube.upload`) and stores refresh token server-side
+    - POST `/api/upload_youtube_file` — multipart form with `file`, optional `title`, `description`, `privacyStatus` (`unlisted` default)
+    - POST `/api/upload_youtube` — upload an existing server-local file (`local_file`) or a mapped `/static/generated/...` URL
+
 - GET `/api/diag` — Diagnostics (ffmpeg, versions, optional folder probe)
 - GET `/health` — Health check
 
@@ -83,7 +91,7 @@ Movie configuration:
 - Base: `OUTPUT_DIR` (default `static/generated`), `CORS_ALLOW_ORIGINS` (default `*`), `HOST`/`PORT` (default `0.0.0.0:8002`)
 - LLM: `LLM_BASE_URL`, `LLM_MODEL`, `LLM_TIMEOUT_SECONDS`, `LLM_API_KEY`, `LLM_API_STYLE`, `LLM_CHAT_PATH`, `LLM_COMPLETIONS_PATH`
 - Images: `IMAGE_STORY_MODEL` (default `models/gemini-2.5-flash-image-preview`), `FALLBACK_IMAGE_MODEL`, `PEOPLE_DIR`
-- Video: `ENABLE_VEO`, `FAL_API_KEY`, `FAL_VEO3_MODEL`, `VIDEO_TIMEOUT_SECONDS`
+- Video: `ENABLE_VEO` (default enabled; set `0`/`false` to disable), `FAL_API_KEY`, `FAL_VEO3_MODEL`, `VIDEO_TIMEOUT_SECONDS`
 
 ## Storybook API (storybook.py)
 
@@ -111,7 +119,7 @@ Storybook configuration:
 
 - Image generation errors or 401/403: ensure `GOOGLE_API_KEY` is set and has access
 - LLM call failed: verify your OpenAI‑compatible server and `LLM_*` settings
-- Video disabled: start Movie with `--model veo` or `ENABLE_VEO=1` and set `FAL_API_KEY`
+- Video disabled: ensure `ENABLE_VEO` is not set to `0` and `FAL_API_KEY` is configured
 - Storybook images not found: confirm they are under `/static/generated/storybook/`
 
 ## Files
@@ -126,4 +134,3 @@ Storybook configuration:
 - `requirements.txt` — Python dependencies
 
 No license specified by default. Add one if needed.
-

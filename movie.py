@@ -1,11 +1,10 @@
 import os
-import argparse
 import logging
 from pathlib import Path
 import re
 import uuid
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, redirect
 from dotenv import load_dotenv
 
 from image_utils import stitch_images_grid, load_reference_image_parts, file_to_genai_part
@@ -16,6 +15,10 @@ from services.motion_poster_service import (
     get_first_look_path,
 )
 from services.video_teaser_service import generate_video_teaser
+from services.youtube_upload import upload_video as youtube_upload_video, YouTubeUploadError
+import json
+import secrets
+import requests
 from services.video_teaser_service import append_poster_and_tag
 import sys
 import subprocess
@@ -49,6 +52,11 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         FAL_API_KEY=os.environ.get("FAL_API_KEY", ""),
         FAL_VEO3_MODEL=os.environ.get("FAL_VEO3_MODEL", "fal-ai/veo3/image-to-video"),
         VIDEO_TIMEOUT_SECONDS=int(os.environ.get("VIDEO_TIMEOUT_SECONDS", "300")),
+        # YouTube OAuth (optional; enables server-managed upload)
+        YT_CLIENT_ID=os.environ.get("YT_CLIENT_ID", ""),
+        YT_CLIENT_SECRET=os.environ.get("YT_CLIENT_SECRET", ""),
+        YT_REDIRECT_URI=os.environ.get("YT_REDIRECT_URI", "http://localhost:8002/api/youtube/callback"),
+        YT_TOKEN_STORE=os.environ.get("YT_TOKEN_STORE", ".tokens/youtube.json"),
     )
 
     Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -218,7 +226,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         if request.method == "OPTIONS":
             return ("", 204)
         if not app.config.get("ENABLE_VEO"):
-            return jsonify({"error": "Video teaser generation is disabled", "details": "Start with --model veo or ENABLE_VEO=1"}), 503
+            return jsonify({"error": "Video teaser generation is disabled", "details": "Set ENABLE_VEO=1 (default) to enable video features."}), 503
 
         title = (request.args.get("title") or "").strip() or None
         synopsis = (request.args.get("synopsis") or "").strip() or None
@@ -280,11 +288,19 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             return jsonify({"error": "image missing", "details": "Provide stitched_image_url or ensure folder has stitched.jpg or first_look"}), 400
 
         try:
-            # Determine output dir based on cached run_dir (title folder); fallback to base
+            # Determine output dir: prefer explicit run_dir param, else cached, else derive from stitched URL, else base
             base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
-            out_dir = str(base_out / (last_payload.get("run_dir") or "")) if last_payload else str(base_out)
-            if not out_dir.strip():
-                out_dir = str(base_out)
+            run_dir_for_out = (request.args.get("run_dir") or "").strip() or (last_payload.get("run_dir") if last_payload else None)
+            if not run_dir_for_out and stitched_image_url:
+                # Try to derive run_dir from stitched image URL: /static/generated/<run_dir>/stitched.jpg
+                try:
+                    marker = "/static/generated/"
+                    if marker in stitched_image_url:
+                        tail = stitched_image_url.split(marker, 1)[1]
+                        run_dir_for_out = tail.split("/", 1)[0]
+                except Exception:
+                    run_dir_for_out = None
+            out_dir = str(base_out / run_dir_for_out) if run_dir_for_out else str(base_out)
             video_result = generate_video_teaser(
                 title=title,
                 synopsis=synopsis,
@@ -473,14 +489,220 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             info["files_present"] = [p.name for p in folder.iterdir()] if folder.exists() else []
         return jsonify(info)
 
+    # --- YouTube OAuth helpers ---
+    def _yt_tokens_load():
+        try:
+            p = Path(app.config["YT_TOKEN_STORE"]).expanduser()
+            if p.exists():
+                return json.loads(p.read_text())
+        except Exception:
+            pass
+        return {}
+
+    def _yt_tokens_save(data):
+        try:
+            p = Path(app.config["YT_TOKEN_STORE"]).expanduser()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(data))
+            return True
+        except Exception:
+            return False
+
+    @app.route("/api/youtube/status", methods=["GET"])  # Do we have refresh token?
+    def youtube_status():
+        toks = _yt_tokens_load()
+        ok = bool(toks.get("refresh_token"))
+        return jsonify({"authorized": ok})
+
+    @app.route("/api/youtube/auth", methods=["GET"])  # Start OAuth
+    def youtube_auth_start():
+        cid = app.config.get("YT_CLIENT_ID")
+        redirect_uri = app.config.get("YT_REDIRECT_URI")
+        if not cid:
+            return "YouTube OAuth not configured: set YT_CLIENT_ID and YT_CLIENT_SECRET", 500
+        state = secrets.token_urlsafe(16)
+        try:
+            setattr(app, "_yt_oauth_state", state)
+        except Exception:
+            pass
+        scope = "https://www.googleapis.com/auth/youtube.upload"
+        url = (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            f"?response_type=code&client_id={requests.utils.quote(cid)}"
+            f"&redirect_uri={requests.utils.quote(redirect_uri)}"
+            f"&scope={requests.utils.quote(scope)}&access_type=offline&include_granted_scopes=true&prompt=consent"
+            f"&state={state}"
+        )
+        return redirect(url, code=302)
+
+    @app.route("/api/youtube/callback", methods=["GET"])  # OAuth redirect URI
+    def youtube_auth_callback():
+        code = request.args.get("code")
+        state = request.args.get("state")
+        expect = getattr(app, "_yt_oauth_state", None)
+        # Basic state check (best-effort in local dev)
+        if expect and state and expect != state:
+            return "State mismatch", 400
+        cid = app.config.get("YT_CLIENT_ID")
+        csecret = app.config.get("YT_CLIENT_SECRET")
+        redirect_uri = app.config.get("YT_REDIRECT_URI")
+        if not (cid and csecret and code):
+            return "Missing OAuth parameters; check YT_CLIENT_ID/SECRET and try again.", 400
+        try:
+            token_resp = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code": code,
+                    "client_id": cid,
+                    "client_secret": csecret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+                timeout=30,
+            )
+            token_resp.raise_for_status()
+            data = token_resp.json()
+            # Persist refresh token for reuse
+            store = _yt_tokens_load()
+            for k in ("refresh_token", "access_token", "scope", "token_type", "expiry", "expires_in"):
+                if k in data:
+                    store[k] = data[k]
+            _yt_tokens_save(store)
+            # Redirect back to root UI
+            return redirect("/", code=302)
+        except Exception as e:
+            return f"OAuth token exchange failed: {e}", 500
+
+    def _yt_mint_access_token_from_request(req) -> str | None:
+        # Prefer explicit Authorization header
+        auth = req.headers.get("Authorization", "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth.split(" ", 1)[1].strip()
+        # Else attempt refresh token flow
+        toks = _yt_tokens_load()
+        rtok = toks.get("refresh_token")
+        cid = app.config.get("YT_CLIENT_ID")
+        csecret = app.config.get("YT_CLIENT_SECRET")
+        if rtok and cid and csecret:
+            try:
+                r = requests.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": rtok,
+                        "client_id": cid,
+                        "client_secret": csecret,
+                    },
+                    timeout=30,
+                )
+                r.raise_for_status()
+                jd = r.json()
+                atok = jd.get("access_token")
+                if atok:
+                    toks.update({k: jd[k] for k in jd if k in ("access_token", "expires_in", "scope", "token_type")})
+                    _yt_tokens_save(toks)
+                    return atok
+            except Exception:
+                return None
+        return None
+
+    @app.route("/api/upload_youtube", methods=["POST", "OPTIONS"])  # upload local teaser to YouTube
+    def upload_youtube():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        data = request.get_json(silent=True) or {}
+        access_token = _yt_mint_access_token_from_request(request)
+        if not access_token:
+            return jsonify({"error": "missing_token", "details": "Not authorized for YouTube. Visit /api/youtube/auth to grant access."}), 401
+
+        # Resolve local file path; prefer local_file under OUTPUT_DIR; else allow URL download
+        local_file = (data.get("local_file") or "").strip()
+        url = (data.get("url") or "").strip()
+        title = (data.get("title") or "").strip() or "Story Spark Teaser"
+        description = (data.get("description") or "").strip() or "Created with Story Spark"
+        privacy = (data.get("privacyStatus") or data.get("privacy_status") or "").strip() or "unlisted"
+
+        # If only URL provided but we have a local path on server, prefer it for stability
+        if (not local_file) and url:
+            # Attempt to map known /static/generated/... URL to a local path
+            try:
+                marker = f"{app.static_url_path.rstrip('/')}/generated/"
+                base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+                if marker in url:
+                    rel = url.split(marker, 1)[1]
+                    candidate = base_out / rel
+                    if candidate.exists():
+                        local_file = str(candidate)
+            except Exception:
+                pass
+
+        if not local_file:
+            return jsonify({"error": "missing_file", "details": "Provide local_file (preferred) or a mapped /static/generated URL"}), 400
+        try:
+            result = youtube_upload_video(
+                access_token=access_token,
+                file_path=local_file,
+                title=title,
+                description=description,
+                privacy_status=privacy,
+            )
+            return jsonify({
+                "status": "uploaded",
+                "id": result.get("id"),
+                "link": result.get("link"),
+                "video": result.get("video"),
+            })
+        except YouTubeUploadError as e:
+            return jsonify({"error": "upload_failed", "details": str(e)}), 500
+
+    @app.route("/api/upload_youtube_file", methods=["POST", "OPTIONS"])  # upload a user-selected file to YouTube
+    def upload_youtube_file():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        access_token = _yt_mint_access_token_from_request(request)
+        if not access_token:
+            return jsonify({"error": "missing_token", "details": "Not authorized for YouTube. Visit /api/youtube/auth to grant access."}), 401
+        if "file" not in request.files:
+            return jsonify({"error": "no_file", "details": "Upload a video via form field 'file'"}), 400
+        f = request.files["file"]
+        title = (request.form.get("title") or "").strip() or f.filename or "Story Spark Upload"
+        description = (request.form.get("description") or "").strip() or "Uploaded with Story Spark"
+        privacy = (request.form.get("privacyStatus") or request.form.get("privacy_status") or "").strip() or "unlisted"
+
+        # Save to temp under OUTPUT_DIR/uploads
+        base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+        out_dir = base_out / "uploads"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = out_dir / ("upload_" + uuid.uuid4().hex + ".mp4")
+        f.save(str(tmp_path))
+        try:
+            result = youtube_upload_video(
+                access_token=access_token,
+                file_path=str(tmp_path),
+                title=title,
+                description=description,
+                privacy_status=privacy,
+            )
+            return jsonify({
+                "status": "uploaded",
+                "id": result.get("id"),
+                "link": result.get("link"),
+                "video": result.get("video"),
+            })
+        except YouTubeUploadError as e:
+            return jsonify({"error": "upload_failed", "details": str(e)}), 500
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     return app
 
 
 if __name__ == "__main__":  # pragma: no cover
-    parser = argparse.ArgumentParser(description="Run the Story Spark server")
-    parser.add_argument("--model", choices=["veo"], help="Enable video teaser generation via FAL.ai Veo3")
-    args = parser.parse_args()
-
-    enable_veo = (os.environ.get("ENABLE_VEO") or "").lower() in {"1", "true", "yes"} or (args.model == "veo")
+    # Video features enabled by default; set ENABLE_VEO=0/false to disable.
+    env_flag = (os.environ.get("ENABLE_VEO") or "").lower()
+    enable_veo = not (env_flag in {"0", "false", "no"})
     app = create_app(enable_veo=enable_veo)
     app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8002")))

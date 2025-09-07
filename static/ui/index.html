@@ -127,6 +127,37 @@
         <div id="upload-preview" class="hint"></div>
         <div id="upload-video-out" class="video-out hidden"></div>
       </section>
+
+      <section id="youtube-tools" class="card">
+        <h3>Upload a Local Video to YouTube</h3>
+        <p class="hint">Choose a video file from your computer and upload it directly to your YouTube channel. First-time use will prompt you to authorize YouTube access.</p>
+        <div class="grid">
+          <label>
+            <span>Select video</span>
+            <input type="file" id="yt-upload-file" accept="video/*" />
+          </label>
+          <label>
+            <span>Title (optional)</span>
+            <input type="text" id="yt-upload-title" placeholder="Defaults to filename" />
+          </label>
+          <label>
+            <span>Description (optional)</span>
+            <input type="text" id="yt-upload-desc" placeholder="Short description" />
+          </label>
+          <label>
+            <span>Privacy</span>
+            <select id="yt-upload-privacy">
+              <option value="unlisted" selected>Unlisted</option>
+              <option value="public">Public</option>
+              <option value="private">Private</option>
+            </select>
+          </label>
+        </div>
+        <div class="actions">
+          <button id="btn-yt-upload-file" class="secondary">Upload to YouTube</button>
+          <span id="yt-file-status" aria-live="polite"></span>
+        </div>
+      </section>
     </main>
 
     <footer>
