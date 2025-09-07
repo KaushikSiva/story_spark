@@ -173,6 +173,14 @@ window.addEventListener("DOMContentLoaded", () => {
       const result = document.getElementById('result');
       renderResult(result, data);
       result.classList.remove('hidden');
+      // Restore teaser player if previously generated
+      if (data.teaser) {
+        const out = document.getElementById('video-out');
+        if (out) {
+          renderVideo(out, { url: data.teaser, duration: 8 });
+          out.classList.remove('hidden');
+        }
+      }
     }
   } catch {}
   // Initialize preview
