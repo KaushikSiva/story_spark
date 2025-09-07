@@ -12,6 +12,13 @@ from pathlib import Path
 from PIL import Image
 import uuid
 import mimetypes
+from image_utils import (
+    extract_images_from_genai_response as _extract_images_from_genai_response,
+    save_images_parts as _save_images_parts,
+    stitch_images_grid,
+    load_reference_image_parts,
+    file_to_genai_part,
+)
 
 
 load_dotenv()
@@ -175,7 +182,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                     for f in files
                 ]
                 # Also create a stitched collage image combining all parts into one
-                stitched = stitch_images_grid(files, out_dir=app.config["OUTPUT_DIR"], tile_size=512)
+                stitched = stitch_images_grid(files, out_dir=app.config["OUTPUT_DIR"], tile_size=512, fixed_name="stitched.jpg")
                 if stitched:
                     payload["stitched_image"] = {
                         "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}",
@@ -183,14 +190,29 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                     }
                 # Create a single first-look poster as well
                 safe_title = (payload.get("title") or title or "Untitled").strip() or "Untitled"
+                # Strengthen identity consistency by passing a few generated frames + stitched as references
+                story_identity_refs = []
+                try:
+                    for fp in (files[:2] if isinstance(files, list) else []):
+                        part = file_to_genai_part(fp)
+                        if part is not None:
+                            story_identity_refs.append(part)
+                    if stitched:
+                        part = file_to_genai_part(stitched)
+                        if part is not None:
+                            story_identity_refs.append(part)
+                except Exception:
+                    pass
+                strong_refs = (list(reference_parts) if reference_parts else []) + story_identity_refs
                 poster_file = generate_poster_from_synopsis(
                     title=safe_title,
                     synopsis=payload["synopsis"],
                     director="Bruno",
                     model_name=app.config["IMAGE_STORY_MODEL"],
                     out_dir=app.config["OUTPUT_DIR"],
-                    reference_parts=reference_parts,
+                    reference_parts=strong_refs,
                     character_target=character_target,
+                    fixed_name="first_look",
                 )
                 if poster_file:
                     payload["poster_image"] = {
@@ -201,9 +223,13 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 # Do not fail the whole request; just omit images
                 logging.getLogger(__name__).warning("image generation failed: %s", e)
         
-        # Cache this response for video teaser generation
+        # Cache this response for later (video + resync). Attach to app for access by other routes
         _last_motion_poster.clear()
         _last_motion_poster.update(payload)
+        try:
+            setattr(app, "_last_motion_poster_cache", dict(payload))
+        except Exception:
+            pass
         
         return jsonify(payload)
 
@@ -273,7 +299,93 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 "traceback": full_traceback
             }), 500
 
+    @app.route("/api/resync_with_poster", methods=["POST", "GET", "OPTIONS"])
+    def resync_with_poster():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        last_payload = getattr(app, "_last_motion_poster_cache", None)
+        if not last_payload:
+            return jsonify({"error": "No cached result", "details": "Run /api/motion_poster first to create poster and stitched image."}), 400
+
+        synopsis = last_payload.get("synopsis") or (request.args.get("synopsis") or "").strip()
+        if not synopsis:
+            return jsonify({"error": "synopsis required", "details": "No cached synopsis found."}), 400
+
+        out_dir = app.config.get("OUTPUT_DIR", "static/generated")
+        poster_path = _get_first_look_path(out_dir)
+        if not poster_path:
+            return jsonify({"error": "poster not found", "details": "Generate a poster first via /api/motion_poster."}), 400
+
+        n_param = request.args.get("n")
+        try:
+            n = int(n_param) if n_param is not None else len(last_payload.get("images", [])) or 8
+        except Exception:
+            n = 8
+        n = max(1, min(12, n))
+
+        refs = []
+        poster_part = file_to_genai_part(poster_path)
+        if poster_part is not None:
+            refs.append(poster_part)
+        people_refs = load_reference_image_parts(people_dir=app.config.get("PEOPLE_DIR", "static/people"), k=4)
+        if people_refs:
+            refs.extend(people_refs)
+
+        try:
+            character_target = int(last_payload.get("num_characters", 1) or 1)
+        except Exception:
+            character_target = 1
+
+        try:
+            files = generate_images_from_synopsis(
+                synopsis=synopsis,
+                model_name=app.config.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
+                out_dir=out_dir,
+                n=n,
+                reference_parts=refs,
+                character_target=character_target,
+            )
+            base_url = request.url_root.rstrip("/")
+            images = [
+                {
+                    "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}",
+                    "filename": Path(f).name,
+                }
+                for f in files
+            ]
+            stitched = stitch_images_grid(files, out_dir=out_dir, tile_size=512, fixed_name="stitched.jpg")
+            stitched_info = None
+            if stitched:
+                stitched_info = {
+                    "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}",
+                    "filename": Path(stitched).name,
+                }
+            new_payload = dict(last_payload)
+            new_payload["images"] = images
+            if stitched_info:
+                new_payload["stitched_image"] = stitched_info
+            setattr(app, "_last_motion_poster_cache", new_payload)
+            return jsonify(new_payload)
+        except Exception as e:
+            logging.getLogger(__name__).error("resync_with_poster failed: %s", e)
+            return jsonify({"error": "resync_failed", "details": str(e)}), 500
+
     return app
+
+    # Note: additional routes can be added before returning app if needed
+
+    
+# removed global route; now registered inside create_app
+
+
+def _get_first_look_path(out_dir: str) -> str | None:
+    p = Path(out_dir)
+    for name in ("first_look.jpg", "first_look.png"):
+        fp = p / name
+        if fp.exists() and fp.is_file():
+            return str(fp)
+    return None
 
 
 def generate_motion_poster_script(*, title: str | None, genre: str | None, synopsis: str | None, seed: int | None, base_url: str, model: str, timeout: int, api_key: str, require_local: bool, api_style: str, chat_path: str, completions_path: str) -> Tuple[Dict[str, Any], str, str | None]:
@@ -585,7 +697,11 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     client = genai.Client(api_key=api_key)
     cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
 
-    prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n, character_target=character_target)
+    try:
+        from motion_poster import build_images_prompt_from_synopsis as _build_images_prompt_tpl
+        prompt = _build_images_prompt_tpl(_enforce_synopsis_lines(synopsis, genre=None), n, character_target=character_target)
+    except Exception:
+        prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n, character_target=character_target)
 
     def _call(model: str):
         contents = (list(reference_parts) + [prompt]) if reference_parts else prompt
@@ -641,6 +757,7 @@ def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno", *, c
         f"Design a cinematic FIRST LOOK MOVIE POSTER for the film titled '{title}'. "
         f"Director credit: Directed by {director}. "
         f"Use the following synopsis to guide the imagery, characters, tone, and setting. "
+        f"CRITICAL: Match the same principal characters as shown in the provided reference photos and frames; keep face identity, hairstyle, and costume colors consistent. "
         f"If candidate human reference photos are provided, choose whichever best match up to {character_target if character_target is not None else 4} characters; "
         f"if characters are non-human or references do not fit, ignore them and invent consistent characters. "
         f"Include tasteful, legible on-poster text: the film title '{title}', the credit 'Directed by {director}', and 2–4 thematically appropriate character names you invent (avoid real IP). "
@@ -650,7 +767,7 @@ def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno", *, c
     )
 
 
-def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, model_name: str, out_dir: str, reference_parts: list | None = None, character_target: int | None = None) -> str | None:
+def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, model_name: str, out_dir: str, reference_parts: list | None = None, character_target: int | None = None, fixed_name: str | None = None) -> str | None:
     if not _GENAI_AVAILABLE:
         return None
     api_key = os.environ.get("GOOGLE_API_KEY")
@@ -660,7 +777,11 @@ def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, m
     client = genai.Client(api_key=api_key)
     cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
 
-    prompt = build_poster_prompt(title, _enforce_synopsis_lines(synopsis, genre=None), director, character_target=character_target)
+    try:
+        from motion_poster import build_poster_prompt as _build_poster_prompt_tpl
+        prompt = _build_poster_prompt_tpl(title, _enforce_synopsis_lines(synopsis, genre=None), director, character_target=character_target)
+    except Exception:
+        prompt = build_poster_prompt(title, _enforce_synopsis_lines(synopsis, genre=None), director, character_target=character_target)
 
     def _call(model: str):
         contents = (list(reference_parts) + [prompt]) if reference_parts else prompt
@@ -680,191 +801,84 @@ def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, m
     parts = _extract_images_from_genai_response(response)
     if not parts:
         return None
+    if fixed_name:
+        # Save first image part to fixed filename, overwriting older variants
+        try:
+            out = _save_image_part_fixed(parts[0], out_dir=out_dir, base_name=fixed_name)
+            return out
+        except Exception:
+            pass
     saved = _save_images_parts(parts[:1], out_dir)
     return saved[0] if saved else None
 
 
 def load_reference_image_parts(*, people_dir: str, k: int) -> list:
-    # Collect candidate image file paths
+    from image_utils import load_reference_image_parts as _impl
+    parts = _impl(people_dir=people_dir, k=k)
     try:
-        p = Path(people_dir)
-        if not p.exists() or not p.is_dir():
-            try:
-                logging.getLogger(__name__).info(
-                    "PEOPLE_DIR missing or not a directory: %s (no references)", people_dir
-                )
-            except Exception:
-                pass
-            return []
-        all_files = [
-            f for f in p.iterdir()
-            if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
-        ]
-        if not all_files:
-            try:
-                logging.getLogger(__name__).info(
-                    "PEOPLE_DIR has no supported image files: %s", people_dir
-                )
-            except Exception:
-                pass
-            return []
-        import random as _rnd
-        chosen = _rnd.sample(all_files, k=min(len(all_files), max(1, int(k))))
-        try:
-            logging.getLogger(__name__).info(
-                "gemini reference images=%s", [str(f) for f in chosen]
-            )
-        except Exception:
-            pass
-        parts = []
-        for f in chosen:
-            try:
-                data = f.read_bytes()
-                mime = mimetypes.guess_type(f.name)[0] or ("image/png" if f.suffix.lower() == ".png" else "image/jpeg")
-                if genai_types and hasattr(genai_types, "Part") and hasattr(genai_types.Part, "from_bytes"):
-                    parts.append(genai_types.Part.from_bytes(data=data, mime_type=mime))
-                else:
-                    import base64
-                    parts.append({"inline_data": {"data": base64.b64encode(data).decode("ascii"), "mime_type": mime}})
-            except Exception:
-                continue
-        return parts
+        logging.getLogger(__name__).info("gemini reference images=%s", [str(getattr(p, 'path', 'inline')) for p in parts])
     except Exception:
-        return []
+        pass
+    return parts
+
+
+def file_to_genai_part(path: str):
+    from image_utils import file_to_genai_part as _impl
+    return _impl(path)
 
 
 def _extract_images_from_genai_response(response):
-    parts_out = []
-    images = getattr(response, "images", None)
-    if images:
-        for img in images:
-            data = getattr(img, "data", None) or getattr(img, "image_bytes", None) or getattr(img, "_image_bytes", None)
-            mime = getattr(img, "mime_type", None) or getattr(img, "mime", None) or "image/png"
-            if data is not None:
-                parts_out.append({"data": data, "mime": mime})
-
-    candidates = getattr(response, "candidates", None) or []
-    for cand in candidates:
-        content = getattr(cand, "content", None)
-        if not content:
-            continue
-        parts = getattr(content, "parts", None) or []
-        for p in parts:
-            inline = getattr(p, "inline_data", None)
-            if inline is not None:
-                data = getattr(inline, "data", None)
-                mime = getattr(inline, "mime_type", None) or "image/png"
-                if data is not None:
-                    parts_out.append({"data": data, "mime": mime})
-                    continue
-            img = getattr(p, "image", None)
-            if img is not None:
-                data = getattr(img, "data", None)
-                mime = getattr(img, "mime_type", None) or "image/png"
-                if data is not None:
-                    parts_out.append({"data": data, "mime": mime})
-                    continue
-            data = getattr(p, "data", None)
-            mime = getattr(p, "mime_type", None)
-            if data is not None and mime is not None:
-                parts_out.append({"data": data, "mime": mime})
-
-    return parts_out
+    from image_utils import extract_images_from_genai_response as _impl
+    return _impl(response)
 
 
 def _save_images_parts(parts, out_dir: str):
+    from image_utils import save_images_parts as _impl
+    return _impl(parts, out_dir)
+
+
+def _save_image_part_fixed(part: dict, *, out_dir: str, base_name: str) -> str:
+    """Save a single image part to a fixed filename, overwriting existing jpg/png variants.
+    base_name can include or omit extension; function will choose jpg/png based on mime.
+    """
     from pathlib import Path
     import base64
-    import uuid
-    saved = []
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    for p in parts:
-        data = p.get("data")
-        mime = p.get("mime") or "image/png"
-        if isinstance(data, str):
-            try:
-                data = base64.b64decode(data)
-            except Exception:
-                data = data.encode("latin-1", errors="ignore")
-        if not isinstance(data, (bytes, bytearray)):
-            continue
-        ext = "png" if "png" in mime else ("jpg" if "jpeg" in mime or "jpg" in mime else "png")
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        path = Path(out_dir) / filename
-        with open(path, "wb") as f:
-            f.write(data)
-        saved.append(str(path))
-    return saved
 
-
-def stitch_images_grid(files: list[str], *, out_dir: str, cols: int | None = None, rows: int | None = None, tile_size: int = 512, bg_color: tuple[int, int, int] = (0, 0, 0)) -> str | None:
-    images: list[Image.Image] = []
-    for fp in files:
+    data = part.get("data")
+    mime = (part.get("mime") or "image/jpeg").lower()
+    if isinstance(data, str):
         try:
-            im = Image.open(fp).convert("RGB")
-            images.append(im)
+            data = base64.b64decode(data)
         except Exception:
-            continue
-    if not images:
-        return None
-    n = len(images)
-    if cols is None or rows is None:
-        # Choose a pleasant grid for common counts
-        grid_map = {
-            1: (1, 1),
-            2: (2, 1),
-            3: (3, 1),
-            4: (2, 2),
-            5: (3, 2),
-            6: (3, 2),
-            7: (4, 2),
-            8: (4, 2),
-            9: (3, 3),
-            10: (4, 3),
-            11: (4, 3),
-            12: (4, 3),
-        }
-        if n in grid_map:
-            cols_calc, rows_calc = grid_map[n]
-        else:
-            import math
-            cols_calc = int(math.ceil(math.sqrt(n)))
-            rows_calc = int(math.ceil(n / max(1, cols_calc)))
-        cols, rows = cols_calc, rows_calc
-    cols = max(1, int(cols))
-    rows = max(1, int(rows))
+            data = data.encode("latin-1", errors="ignore")
+    if not isinstance(data, (bytes, bytearray)):
+        raise RuntimeError("Invalid image data for fixed save")
 
-    # Normalize to uniform thumbnails
-    thumbs: list[Image.Image] = []
-    for im in images[: cols * rows]:
-        # Preserve aspect ratio within tile bounds, then letterbox on background
-        tw = th = int(tile_size)
-        im2 = im.copy()
-        im2.thumbnail((tw, th), Image.LANCZOS)
-        canvas = Image.new("RGB", (tw, th), bg_color)
-        x = (tw - im2.width) // 2
-        y = (th - im2.height) // 2
-        canvas.paste(im2, (x, y))
-        thumbs.append(canvas)
+    # Normalize base name and decide extension
+    bn = Path(base_name).stem
+    ext = "jpg"
+    if "png" in mime:
+        ext = "png"
+    elif "jpeg" in mime or "jpg" in mime:
+        ext = "jpg"
 
-    width = cols * tile_size
-    height = rows * tile_size
-    collage = Image.new("RGB", (width, height), bg_color)
-    i = 0
-    for r in range(rows):
-        for c in range(cols):
-            if i >= len(thumbs):
-                break
-            collage.paste(thumbs[i], (c * tile_size, r * tile_size))
-            i += 1
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    # Remove any previous jpg/png variants
+    for e in ("jpg", "png"):
+        try:
+            (out_dir_path / f"{bn}.{e}").unlink(missing_ok=True)
+        except Exception:
+            pass
+    out_path = out_dir_path / f"{bn}.{ext}"
+    with open(out_path, "wb") as f:
+        f.write(data)
+    return str(out_path)
 
-    out_name = f"{uuid.uuid4().hex}.jpg"
-    out_path = str(Path(out_dir) / out_name)
-    try:
-        collage.save(out_path, format="JPEG", quality=90)
-        return out_path
-    except Exception:
-        return None
+
+def stitch_images_grid(files: list[str], *, out_dir: str, cols: int | None = None, rows: int | None = None, tile_size: int = 512, bg_color: tuple[int, int, int] = (0, 0, 0), fixed_name: str | None = None) -> str | None:
+    from image_utils import stitch_images_grid as _impl
+    return _impl(files, out_dir=out_dir, cols=cols, rows=rows, tile_size=tile_size, bg_color=bg_color, fixed_name=fixed_name)
 
 
 def _strip_llm_artifacts(text: str) -> str:
@@ -961,13 +975,18 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
     video_prompt = build_video_prompt(title=title, synopsis=synopsis, duration=duration)
     
     # Prepare the request payload according to FAL.ai Veo3 API
-    payload = {
-        "prompt": video_prompt,
-        "image_url": final_image_url,
-        "duration": f"{duration}s",  # FAL expects format like "8s"
-        "resolution": "720p",  # FAL default
-        "generate_audio": True
-    }
+    # Current Veo3 endpoint expects exactly 8s duration; override to safe value
+    duration_effective = 8
+    duration_str = "8s"
+    def make_payload(prompt_text: str) -> dict:
+        return {
+            "prompt": prompt_text,
+            "image_url": final_image_url,
+            "duration": duration_str,  # Veo3 currently supports only '8s'
+            "resolution": "720p",  # FAL default
+            "generate_audio": True,
+        }
+    payload = make_payload(video_prompt)
     
     headers = {
         "Authorization": f"Key {fal_api_key}",
@@ -987,11 +1006,32 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
             try:
                 error_details = response.json()
                 log.error(f"FAL.ai API error details: {error_details}")
-                raise RuntimeError(f"FAL.ai API error ({response.status_code}): {error_details}")
+                # Attempt a safe-mode retry on content policy violations
+                err_type = None
+                if isinstance(error_details, dict):
+                    det = error_details.get("detail")
+                    if isinstance(det, list) and det and isinstance(det[0], dict):
+                        err_type = det[0].get("type")
+                if response.status_code == 422 and err_type == "content_policy_violation":
+                    log.info("Retrying video generation with policy‑safe prompt…")
+                    safe_prompt = build_video_prompt(title=title, synopsis=synopsis, duration=duration, safe=True)
+                    payload2 = make_payload(safe_prompt)
+                    response2 = requests.post(submit_url, json=payload2, headers=headers, timeout=timeout)
+                    if response2.status_code != 200:
+                        try:
+                            error_details2 = response2.json()
+                            log.error(f"FAL.ai SAFE retry error: {error_details2}")
+                        except Exception:
+                            log.error(f"FAL.ai SAFE retry error text: {response2.text}")
+                        raise RuntimeError(f"FAL.ai API error ({response2.status_code}): SAFE retry failed")
+                    result = response2.json()
+                else:
+                    raise RuntimeError(f"FAL.ai API error ({response.status_code}): {error_details}")
             except:
                 log.error(f"FAL.ai API error response: {response.text}")
                 raise RuntimeError(f"FAL.ai API error ({response.status_code}): {response.text}")
-        result = response.json()
+        if 'result' not in locals():
+            result = response.json()
         
         # Check if we have a direct video URL or need to poll for results
         if "video" in result and "url" in result["video"]:
@@ -1003,7 +1043,7 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
             return {
                 "video_url": video_url,
                 "local_file": local_file,
-                "duration": duration,
+                "duration": duration_effective,
                 "prompt": video_prompt,
                 "model": model,
                 "status": "completed"
@@ -1020,7 +1060,7 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
         raise RuntimeError(f"FAL.ai API request failed: {str(e)}")
 
 
-def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> str:
+def build_video_prompt(*, title: str | None, synopsis: str, duration: int, safe: bool = False) -> str:
     """Build an effective prompt for video generation"""
     import re
     
@@ -1028,11 +1068,17 @@ def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> st
     def sanitize_synopsis(text: str) -> str:
         # List of potentially problematic terms that trigger content policy
         problematic_terms = [
-            r'demonic?\s+possession', r'evil', r'malicious\s+spirit', r'paranormal', 
+            # supernatural/horror
+            r'demonic?\s+possession', r'evil', r'malicious\s+spirit', r'paranormal',
             r'horror', r'demon', r'supernatural', r'occult', r'exorcism',
-            r'stag\s+party', r'bachelor\s+party', r'wild.*party', r'drinking', 
-            r'drunk', r'alcohol', r'drug', r'substance', r'hangover',
-            r'Las\s+Vegas', r'casino', r'gambling', r'strip\s+club'
+            # adult content / substances
+            r'stag\s+party', r'bachelor\s+party', r'wild.*party', r'drinking',
+            r'drunk', r'alcohol', r'drug[s]?', r'substance', r'hangover',
+            r'casino', r'gambling', r'strip\s+club',
+            # violence / crime words
+            r'gangster', r'gang', r'crime\b', r'criminal', r'syndicate', r'cartel', r'mafia',
+            r'kidnap', r'hostage', r'assassin', r'assassination', r'murder', r'kill', r'killed', r'killer',
+            r'weapon', r'gun', r'knife', r'blood', r'violent', r'violence', r'revenge', r'fight', r'warfare',
         ]
         
         sanitized = text
@@ -1043,19 +1089,38 @@ def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> st
         sanitized = re.sub(r'\s+', ' ', sanitized).strip()
         sanitized = re.sub(r'[,;]\s*[,;]', ',', sanitized)
         
+        # Remove likely proper nouns (single Title‑case words) to avoid personal names
+        sanitized = re.sub(r'\b([A-Z][a-z]{2,})\b', 'a character', sanitized)
+
         # If synopsis becomes too short after sanitization, use generic description
         if len(sanitized.strip()) < 50:
-            return "A group of friends embark on an adventure that leads to unexpected challenges and discoveries."
-            
+            return (
+                "A determined character faces escalating challenges and must make a courageous choice "
+                "with allies by their side."
+            )
+
         return sanitized
     
-    prompt_parts = [
-        f"Create a cinematic {duration}-second movie teaser trailer.",
-        "High production value with dramatic lighting and professional cinematography.",
-        "Include dynamic camera movements, engaging visual storytelling.",
-        "No text overlays or credits - pure visual narrative.",
-        "Maintain consistent characters and setting throughout."
-    ]
+    try:
+        from video_teaser import build_video_prompt_base as _video_base, build_video_prompt_safe_suffix as _video_safe
+        prompt_base = _video_base(duration)
+        safe_suffix = _video_safe() if safe else ""
+        prompt_parts = [prompt_base]
+    except Exception:
+        prompt_parts = [
+            f"Create an irresistible {duration}-second movie teaser trailer.",
+            "Hook viewers in the first 2 seconds with a striking image or motion.",
+            "High production value with dramatic lighting and professional cinematography.",
+            "Dynamic camera moves: push-ins, whip pans, aerial reveals, match cuts.",
+            "No on-screen text overlays or credits; pure visual narrative.",
+            "Maintain consistent characters and setting throughout.",
+            "Sound: cinematic trailer music with a clear motif, rhythmic pulses, risers, braams, and stingers; tasteful sound design cues; purposeful moments of near-silence before impacts.",
+            "Build tension and intrigue; escalate stakes; end on a memorable hard button and audio sting.",
+        ]
+        safe_suffix = (
+            " Content constraints: no depictions of violence, weapons, criminal activity, or harm; keep it suspenseful and family‑safe. "
+            "Use implication and atmosphere instead of explicit conflict; focus on wonder, stakes, and character emotion."
+        ) if safe else ""
     
     if title:
         prompt_parts.append(f"Movie title context: {title}")
@@ -1072,7 +1137,9 @@ def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> st
         "Professional movie trailer quality with cinematic color grading."
     ])
     
-    return " ".join(prompt_parts)
+    if safe and safe_suffix:
+        prompt_parts.append(safe_suffix)
+    return " ".join(p for p in prompt_parts if p)
 
 
 def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout: int) -> Dict[str, Any]:
@@ -1102,7 +1169,7 @@ def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout
                     return {
                         "video_url": video_url,
                         "local_file": local_file,
-                        "duration": result.get("duration", 8),
+                        "duration": duration_effective,
                         "model": model,
                         "status": "completed",
                         "request_id": request_id
@@ -1128,27 +1195,31 @@ def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout
 
 
 def download_video_file(video_url: str, output_dir: str) -> str:
-    """Download video file from URL and save locally"""
+    """Download video file to a fixed name teaser.mp4, overwriting if exists."""
     from pathlib import Path
-    
-    # Create output directory if it doesn't exist
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Generate unique filename
-    filename = f"teaser_{uuid.uuid4().hex}.mp4"
-    filepath = Path(output_dir) / filename
-    
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fixed filename
+    filepath = out_dir / "teaser.mp4"
+    try:
+        # Remove previous file if present
+        filepath.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     try:
         response = requests.get(video_url, stream=True, timeout=60)
         response.raise_for_status()
-        
-        with open(filepath, 'wb') as f:
+
+        with open(filepath, "wb") as f:
             for chunk in response.iter_content(chunk_size=8192):
                 if chunk:
                     f.write(chunk)
-        
+
         return str(filepath)
-        
+
     except Exception as e:
         raise RuntimeError(f"Failed to download video: {str(e)}")
 

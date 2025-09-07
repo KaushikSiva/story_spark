@@ -13,6 +13,8 @@ input[type=text],select{width:100%;background:#0f1620;color:var(--text);border:1
 @media (max-width:560px){.grid{grid-template-columns:1fr}}
 .actions{display:flex;align-items:center;gap:12px;margin-top:10px}
 button{background:var(--accent);color:#06101e;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+button.secondary{background:#45566b;color:#e7eef5}
+button:disabled{opacity:.5;cursor:not-allowed}
 #status{color:var(--muted)}
 .hidden{display:none}
 .meta{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
@@ -30,4 +32,7 @@ button{background:var(--accent);color:#06101e;border:0;border-radius:10px;paddin
 @media (max-width:560px){.imgs{grid-template-columns:1fr}}
 .img img{width:100%;height:auto;border-radius:8px;display:block}
 footer small{color:var(--muted)}
-
+/* video */
+.video-out .video-wrap{margin-top:10px}
+.video-out video{width:100%;max-height:520px;border-radius:10px;background:#000}
+.small .pill{font-size:11px}

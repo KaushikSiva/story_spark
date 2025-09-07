@@ -12,6 +12,8 @@ function qs(params) {
   return sp.toString();
 }
 
+let LAST_RESULT = null;
+
 function renderResult(container, data) {
   const title = data.title || "Untitled";
   const genre = data.genre || "";
@@ -42,6 +44,27 @@ function renderResult(container, data) {
     </div>
     ${images.length ? `<h3>All Images</h3><div class="grid imgs">${images.map(renderImage).join("")}</div>` : ""}
   `;
+
+  // Cache for video step and toggle UI
+  LAST_RESULT = data;
+  const hasStitched = !!(data.stitched_image && data.stitched_image.url);
+  const hasPoster = !!(data.poster_image && data.poster_image.url);
+  const videoTools = document.getElementById("video-tools");
+  const btnVideo = document.getElementById("btn-video");
+  const consistencyTools = document.getElementById("consistency-tools");
+  const btnResync = document.getElementById("btn-resync");
+  if (videoTools) {
+    videoTools.classList.remove("hidden");
+  }
+  if (btnVideo) {
+    btnVideo.disabled = !hasStitched;
+  }
+  if (consistencyTools) {
+    consistencyTools.classList.remove("hidden");
+  }
+  if (btnResync) {
+    btnResync.disabled = !hasPoster;
+  }
 }
 
 function renderImgCard(title, obj) {
@@ -111,5 +134,98 @@ async function handleSubmit(e) {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("#gen-form").addEventListener("submit", handleSubmit);
+  const btnVideo = document.getElementById("btn-video");
+  if (btnVideo) btnVideo.addEventListener("click", handleGenerateVideo);
+  const btnResync = document.getElementById("btn-resync");
+  if (btnResync) btnResync.addEventListener("click", handleResyncWithPoster);
 });
 
+async function handleGenerateVideo() {
+  const btn = document.getElementById("btn-video");
+  const status = document.getElementById("video-status");
+  const out = document.getElementById("video-out");
+  const durSel = document.getElementById("teaser-duration");
+
+  if (!LAST_RESULT || !LAST_RESULT.stitched_image || !LAST_RESULT.stitched_image.url) {
+    status.textContent = "Need stitched image first. Generate images above.";
+    return;
+  }
+
+  const stitched = LAST_RESULT.stitched_image.url;
+  const synopsis = (LAST_RESULT.synopsis || "").trim();
+  const duration = durSel ? durSel.value : "10";
+
+  // Build query safely
+  const sp = new URLSearchParams();
+  if (synopsis) sp.set("synopsis", synopsis);
+  sp.set("stitched_image_url", stitched);
+  sp.set("duration", duration);
+
+  const url = `/api/video_teaser?${sp.toString()}`;
+  btn.disabled = true;
+  status.textContent = "Creating teaser…";
+  out.classList.add("hidden");
+  out.innerHTML = "";
+  try {
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    }
+    renderVideo(out, data);
+    out.classList.remove("hidden");
+    status.textContent = "Done";
+  } catch (e) {
+    console.error(e);
+    status.textContent = `Error: ${e.message || e}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderVideo(container, data) {
+  const url = data.url || (data.local_file ? `/static/generated/${data.local_file.split('/').pop()}` : "");
+  const remote = data.video_url || "";
+  const prompt = data.prompt || "";
+  const model = data.model || "";
+  const dur = data.duration || data.duration_seconds || "";
+  container.innerHTML = `
+    <div class="video-wrap">
+      ${url ? `<video controls src="${encodeURI(url)}"></video>` : "<div class=muted>No local video file created</div>"}
+      ${remote && !url ? `<p><a href="${encodeURI(remote)}" target="_blank" rel="noopener">Open remote video</a></p>` : ""}
+    </div>
+    <div class="meta small">
+      ${dur ? `<span class="pill">${dur}s</span>` : ""}
+      ${model ? `<span class="pill alt">${escapeHtml(model)}</span>` : ""}
+    </div>
+  `;
+}
+
+async function handleResyncWithPoster() {
+  const btn = document.getElementById("btn-resync");
+  const status = document.getElementById("resync-status");
+  const result = document.getElementById("result");
+  if (!LAST_RESULT || !LAST_RESULT.poster_image || !LAST_RESULT.poster_image.url) {
+    status.textContent = "Need poster first. Generate images above.";
+    return;
+  }
+  btn.disabled = true;
+  status.textContent = "Re‑syncing faces…";
+  try {
+    const sp = new URLSearchParams();
+    // optional: preserve image count
+    const n = (LAST_RESULT.images && LAST_RESULT.images.length) ? String(LAST_RESULT.images.length) : "8";
+    sp.set("n", n);
+    const res = await fetch(`/api/resync_with_poster?${sp.toString()}`, { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    renderResult(result, data);
+    result.classList.remove("hidden");
+    status.textContent = "Faces re‑synced";
+  } catch (e) {
+    console.error(e);
+    status.textContent = `Error: ${e.message || e}`;
+  } finally {
+    btn.disabled = false;
+  }
+}

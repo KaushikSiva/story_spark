@@ -66,6 +66,33 @@
       </section>
 
       <section id="result" class="card hidden"></section>
+
+      <section id="consistency-tools" class="card hidden">
+        <h3>Consistency Tools</h3>
+        <p class="hint">Use the poster as a face/style reference to regenerate the story images and collage.</p>
+        <div class="actions">
+          <button id="btn-resync" class="secondary" disabled>Re‑sync Faces (use Poster)</button>
+          <span id="resync-status" aria-live="polite"></span>
+        </div>
+      </section>
+
+      <section id="video-tools" class="card hidden">
+        <h3>Video Teaser</h3>
+        <div class="grid">
+          <label>
+            <span>Duration (seconds)</span>
+            <select id="teaser-duration" disabled>
+              <option value="8" selected>8</option>
+            </select>
+          </label>
+          <div class="hint">Only 8s supported by the current video model.</div>
+        </div>
+        <div class="actions">
+          <button id="btn-video" class="secondary" disabled>Generate Teaser</button>
+          <span id="video-status" aria-live="polite"></span>
+        </div>
+        <div id="video-out" class="video-out hidden"></div>
+      </section>
     </main>
 
     <footer>
@@ -75,4 +102,3 @@
     <script src="/static/ui/app.js"></script>
   </body>
   </html>
-

@@ -1,63 +1,53 @@
 import os
-import uuid
-import base64
-from datetime import datetime
+import argparse
+import logging
 from pathlib import Path
-
+from datetime import datetime
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
-import threading
-import time
 
-load_dotenv()  # Load env vars from .env if present
-
-try:
-    # Prefer the new google-genai client if available
-    from google import genai  # type: ignore
-    _GENAI_MODE = "google-genai"
-except Exception:  # pragma: no cover
-    genai = None
-    _GENAI_MODE = None
-
-try:
-    # Types for config (GenerateContentConfig)
-    from google.genai import types as genai_types  # type: ignore
-except Exception:  # pragma: no cover
-    genai_types = None
-
-try:
-    # Fallback to legacy google.generativeai if installed
-    import google.generativeai as legacy_genai  # type: ignore
-except Exception:  # pragma: no cover
-    legacy_genai = None
+from image_utils import stitch_images_grid, load_reference_image_parts, file_to_genai_part
+from services.motion_poster_service import (
+    generate_motion_poster_script,
+    generate_images_from_synopsis,
+    generate_poster_from_synopsis,
+    get_first_look_path,
+)
+from services.video_teaser_service import generate_video_teaser
 
 
-def create_app() -> Flask:
+load_dotenv()
+
+
+def create_app(*, enable_veo: bool = False) -> Flask:
     app = Flask(__name__, static_folder="static", static_url_path="/static")
+    logging.basicConfig(level=logging.INFO)
+    log = logging.getLogger(__name__)
 
-    # Basic config
     app.config.update(
         OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
-        DEFAULT_IMAGE_COUNT=int(os.environ.get("IMAGE_COUNT", "5")),
-        IMAGE_SIZE=os.environ.get("IMAGE_SIZE", "1024x1024"),
-        MODEL=os.environ.get("GENERATION_MODEL", "models/gemini-2.5-flash-image-preview"),
-        OUTPUT_TTL_SECONDS=int(os.environ.get("OUTPUT_TTL_SECONDS", str(60 * 60))),  # default 1 hour
-        OUTPUT_SWEEP_INTERVAL_SECONDS=int(os.environ.get("OUTPUT_SWEEP_INTERVAL_SECONDS", str(10 * 60))),  # default 10 min
-        # CORS: allow all by default; tighten in production
         CORS_ALLOW_ORIGINS=os.environ.get("CORS_ALLOW_ORIGINS", "*"),
+        # LLM
+        LLM_BASE_URL=os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
+        LLM_MODEL=os.environ.get("LLM_MODEL", "openai/gpt-oss-20b"),
+        LLM_TIMEOUT_SECONDS=int(os.environ.get("LLM_TIMEOUT_SECONDS", "45")),
+        LLM_API_KEY=os.environ.get("LLM_API_KEY", ""),
+        LLM_API_STYLE=os.environ.get("LLM_API_STYLE", "auto"),
+        LLM_CHAT_PATH=os.environ.get("LLM_CHAT_PATH", "/chat/completions"),
+        LLM_COMPLETIONS_PATH=os.environ.get("LLM_COMPLETIONS_PATH", "/completions"),
+        # Images
+        IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
+        FALLBACK_IMAGE_MODEL=os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview"),
+        PEOPLE_DIR=os.environ.get("PEOPLE_DIR", "static/people"),
+        # Video
+        ENABLE_VEO=bool(enable_veo),
+        FAL_API_KEY=os.environ.get("FAL_API_KEY", ""),
+        FAL_VEO3_MODEL=os.environ.get("FAL_VEO3_MODEL", "fal-ai/veo3/image-to-video"),
+        VIDEO_TIMEOUT_SECONDS=int(os.environ.get("VIDEO_TIMEOUT_SECONDS", "300")),
     )
 
-    # Ensure output directory exists
     Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
-    # Initial sweep and start periodic sweeper once per process
-    _sweep_output_dir(app.config["OUTPUT_DIR"], app.config["OUTPUT_TTL_SECONDS"])  # best-effort
-    _start_periodic_sweeper(
-        app.config["OUTPUT_DIR"],
-        app.config["OUTPUT_TTL_SECONDS"],
-        app.config["OUTPUT_SWEEP_INTERVAL_SECONDS"],
-    )
 
-    # Light, dependency-free CORS headers
     @app.after_request
     def add_cors_headers(resp):  # pragma: no cover
         resp.headers["Access-Control-Allow-Origin"] = app.config["CORS_ALLOW_ORIGINS"]
@@ -69,353 +59,244 @@ def create_app() -> Flask:
     def health():
         return jsonify({"status": "ok", "time": datetime.utcnow().isoformat() + "Z"})
 
-    @app.route("/api/generate", methods=["GET", "OPTIONS"])
-    def generate_images():
-        if request.method == "OPTIONS":  # CORS preflight
+    # Simple UI routes
+    @app.route("/", methods=["GET"])  # serve UI
+    @app.route("/ui", methods=["GET"])  # alias
+    def ui_root():  # pragma: no cover
+        try:
+            return app.send_static_file("ui/index.html")
+        except Exception:
+            return "UI not found. Ensure static/ui/index.html exists.", 404
+
+    @app.route("/api/motion_poster", methods=["GET", "OPTIONS"])
+    def motion_poster():
+        if request.method == "OPTIONS":
             return ("", 204)
 
-        # Read from query parameters for GET
-        name = (request.args.get("name") or "").strip()
-        year_str = str(request.args.get("year") or "").strip()
-        style = (request.args.get("style") or "").strip()
-        # Parse n safely
+        title = (request.args.get("title") or request.args.get("movie") or "").strip() or None
+        genre = (request.args.get("genre") or "").strip() or None
+        synopsis = (request.args.get("synopsis") or request.args.get("scene") or "").strip() or None
+        seed_param = request.args.get("seed")
+        try:
+            seed = int(seed_param) if seed_param is not None else None
+        except Exception:
+            seed = None
+
+        require_local = (request.args.get("require_local") or "").lower() in {"1", "true", "yes"}
+        api_style = (request.args.get("api_style") or app.config["LLM_API_STYLE"]).lower()
+
+        result, source, llm_error = generate_motion_poster_script(
+            title=title,
+            genre=genre,
+            synopsis=synopsis,
+            seed=seed,
+            base_url=app.config["LLM_BASE_URL"],
+            model=app.config["LLM_MODEL"],
+            timeout=app.config["LLM_TIMEOUT_SECONDS"],
+            api_key=app.config["LLM_API_KEY"],
+            require_local=require_local,
+            api_style=api_style,
+            chat_path=app.config["LLM_CHAT_PATH"],
+            completions_path=app.config["LLM_COMPLETIONS_PATH"],
+        )
+
+        final_title_for_log = (result.get("title") or title or "Untitled")
+        log.info("motion_poster source=%s title=%s genre=%s synopsis=%s", source, final_title_for_log, result.get("genre"), result.get("synopsis"))
+        if llm_error:
+            log.warning("motion_poster llm_error=%s", llm_error)
+
+        payload = {
+            "title": (result.get("title") or title or "Untitled"),
+            "synopsis": result.get("synopsis", ""),
+            "num_characters": int(result.get("num_characters", 1) or 1),
+            "genre": result.get("genre", ""),
+            "source": source,
+        }
+
+        # Images default on; disable with generate_images=0/false/no
+        flag_raw = (request.args.get("generate_images") or request.args.get("images"))
+        gen_images_flag = True if flag_raw is None else (str(flag_raw).lower() not in {"0", "false", "no"})
+        if gen_images_flag:
+            try:
+                n_param = request.args.get("n")
+                n = int(n_param) if n_param is not None else 8
+                n = max(1, min(12, n))
+            except Exception:
+                n = 8
+
+            # Character references from generated JSON
+            character_target = int(payload.get("num_characters", 1) or 1)
+            ref_parts = load_reference_image_parts(people_dir=app.config["PEOPLE_DIR"], k=character_target + 4)
+            log.info("character_target=%s; reference_count=%s", character_target, len(ref_parts))
+
+            try:
+                files = generate_images_from_synopsis(
+                    synopsis=payload["synopsis"],
+                    model_name=app.config["IMAGE_STORY_MODEL"],
+                    out_dir=app.config["OUTPUT_DIR"],
+                    n=n,
+                    reference_parts=ref_parts,
+                    character_target=character_target,
+                )
+                base_url = request.url_root.rstrip("/")
+                payload["images"] = [{"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}", "filename": Path(f).name} for f in files]
+
+                # stitched (fixed name)
+                stitched = stitch_images_grid(files, out_dir=app.config["OUTPUT_DIR"], tile_size=512, fixed_name="stitched.jpg")
+                if stitched:
+                    payload["stitched_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}", "filename": Path(stitched).name}
+
+                # poster (use story frames + stitched as extra refs)
+                extra_refs = []
+                try:
+                    for fp in files[:2]:
+                        p = file_to_genai_part(fp)
+                        if p is not None:
+                            extra_refs.append(p)
+                    if stitched:
+                        p = file_to_genai_part(stitched)
+                        if p is not None:
+                            extra_refs.append(p)
+                except Exception:
+                    pass
+                strong_refs = (list(ref_parts) if ref_parts else []) + extra_refs
+                poster_file = generate_poster_from_synopsis(
+                    title=(payload.get("title") or "Untitled"),
+                    synopsis=payload["synopsis"],
+                    director="Bruno",
+                    model_name=app.config["IMAGE_STORY_MODEL"],
+                    out_dir=app.config["OUTPUT_DIR"],
+                    reference_parts=strong_refs,
+                    character_target=character_target,
+                    fixed_name="first_look",
+                )
+                if poster_file:
+                    payload["poster_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(poster_file).name}", "filename": Path(poster_file).name}
+            except Exception as e:  # pragma: no cover
+                log.warning("image generation failed: %s", e)
+
+        # Cache
+        try:
+            setattr(app, "_last_motion_poster_cache", dict(payload))
+        except Exception:
+            pass
+        return jsonify(payload)
+
+    @app.route("/api/video_teaser", methods=["GET", "OPTIONS"])
+    def video_teaser_route():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if not app.config.get("ENABLE_VEO"):
+            return jsonify({"error": "Video teaser generation is disabled", "details": "Start with --model veo or ENABLE_VEO=1"}), 503
+
+        title = (request.args.get("title") or "").strip() or None
+        synopsis = (request.args.get("synopsis") or "").strip() or None
+        stitched_image_url = (request.args.get("stitched_image_url") or "").strip() or None
+        duration = 8  # enforced by service/model
+
+        # Pull from cache if missing
+        last_payload = getattr(app, "_last_motion_poster_cache", None)
+        if not synopsis and last_payload:
+            synopsis = last_payload.get("synopsis")
+            title = title or last_payload.get("title")
+        if not stitched_image_url and last_payload and last_payload.get("stitched_image"):
+            stitched_image_url = last_payload["stitched_image"].get("url")
+
+        if not synopsis:
+            return jsonify({"error": "synopsis parameter is required or call /api/motion_poster first"}), 400
+        if not stitched_image_url:
+            return jsonify({"error": "stitched_image_url parameter is required or call /api/motion_poster first"}), 400
+
+        try:
+            video_result = generate_video_teaser(
+                title=title,
+                synopsis=synopsis,
+                image_url=stitched_image_url,
+                duration=duration,
+                fal_api_key=app.config["FAL_API_KEY"],
+                model=app.config["FAL_VEO3_MODEL"],
+                timeout=app.config["VIDEO_TIMEOUT_SECONDS"],
+            )
+            # attach convenience URL
+            base_url = request.url_root.rstrip("/")
+            if video_result.get("local_file"):
+                video_result["url"] = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(video_result['local_file']).name}"
+            video_result["stitched_image_url"] = stitched_image_url
+            return jsonify(video_result)
+        except Exception as e:
+            logging.getLogger(__name__).error("Video teaser generation failed: %s", e)
+            return jsonify({"error": "Video generation failed", "details": str(e)}), 500
+
+    @app.route("/api/resync_with_poster", methods=["POST", "GET", "OPTIONS"])
+    def resync_with_poster():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        last_payload = getattr(app, "_last_motion_poster_cache", None)
+        if not last_payload:
+            return jsonify({"error": "No cached result", "details": "Run /api/motion_poster first to create poster and stitched image."}), 400
+
+        synopsis = last_payload.get("synopsis") or (request.args.get("synopsis") or "").strip()
+        if not synopsis:
+            return jsonify({"error": "synopsis required", "details": "No cached synopsis found."}), 400
+
+        out_dir = app.config.get("OUTPUT_DIR", "static/generated")
+        poster_path = get_first_look_path(out_dir)
+        if not poster_path:
+            return jsonify({"error": "poster not found", "details": "Generate a poster first via /api/motion_poster."}), 400
+
         n_param = request.args.get("n")
         try:
-            n = int(n_param) if n_param is not None else int(app.config["DEFAULT_IMAGE_COUNT"])
+            n = int(n_param) if n_param is not None else len(last_payload.get("images", [])) or 8
         except Exception:
-            n = int(app.config["DEFAULT_IMAGE_COUNT"])
-        # Parse ttl
-        ttl_param = request.args.get("ttl_seconds")
-        try:
-            ttl_seconds = int(ttl_param) if ttl_param is not None else int(app.config["OUTPUT_TTL_SECONDS"])
-        except Exception:
-            ttl_seconds = int(app.config["OUTPUT_TTL_SECONDS"])
-        ttl_seconds = max(10, ttl_seconds)  # minimum 10s
+            n = 8
+        n = max(1, min(12, n))
 
-        if not name or not year_str.isdigit():
-            return (
-                jsonify({
-                    "error": "Invalid input",
-                    "details": "Provide 'name' (string) and 'year' (number)",
-                }),
-                400,
-            )
-        year = int(year_str)
+        refs = []
+        poster_part = file_to_genai_part(poster_path)
+        if poster_part is not None:
+            refs.append(poster_part)
+        people_refs = load_reference_image_parts(people_dir=app.config.get("PEOPLE_DIR", "static/people"), k=4)
+        if people_refs:
+            refs.extend(people_refs)
 
         try:
-            files = _generate_and_save(
-                prompt=_build_prompt(name, year, style),
+            character_target = int(last_payload.get("num_characters", 1) or 1)
+        except Exception:
+            character_target = 1
+
+        try:
+            files = generate_images_from_synopsis(
+                synopsis=synopsis,
+                model_name=app.config.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
+                out_dir=out_dir,
                 n=n,
-                image_size=app.config["IMAGE_SIZE"],
-                model_name=app.config["MODEL"],
-                out_dir=app.config["OUTPUT_DIR"],
+                reference_parts=refs,
+                character_target=character_target,
             )
-        except Exception as e:  # pragma: no cover
-            return (
-                jsonify({
-                    "error": "Image generation failed",
-                    "details": str(e),
-                }),
-                500,
-            )
-
-        base_url = request.url_root.rstrip("/")
-        images = [
-            {
-                "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}",
-                "filename": Path(f).name,
-            }
-            for f in files
-        ]
-
-        # Schedule cleanup of generated images after TTL
-        _schedule_cleanup(files, ttl_seconds)
-
-        return jsonify({
-            "name": name,
-            "year": int(year),
-            "count": len(images),
-            "images": images,
-            "model": app.config["MODEL"],
-            "size": app.config["IMAGE_SIZE"],
-            "ttl_seconds": ttl_seconds,
-        })
+            base_url = request.url_root.rstrip("/")
+            images = [{"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}", "filename": Path(f).name} for f in files]
+            stitched = stitch_images_grid(files, out_dir=out_dir, tile_size=512, fixed_name="stitched.jpg")
+            stitched_info = None
+            if stitched:
+                stitched_info = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}", "filename": Path(stitched).name}
+            new_payload = dict(last_payload)
+            new_payload["images"] = images
+            if stitched_info:
+                new_payload["stitched_image"] = stitched_info
+            setattr(app, "_last_motion_poster_cache", new_payload)
+            return jsonify(new_payload)
+        except Exception as e:
+            logging.getLogger(__name__).error("resync_with_poster failed: %s", e)
+            return jsonify({"error": "resync_failed", "details": str(e)}), 500
 
     return app
 
 
-def _build_prompt(name: str, year: int, style: str) -> str:
-    realism_rules = _historical_realism_rules(year)
-    development_rules = _development_scaling_guidance(year)
-    parts = [
-        f"Create a realistic, historically accurate scene featuring {name} in the year {year}.",
-        "Adhere strictly to the technology, clothing, architecture, signage, vehicles, and materials available in that year.",
-        "Avoid anachronisms or future tech beyond the specified year.",
-        realism_rules,
-        development_rules,
-        "High fidelity, coherent perspective, natural lighting, detailed textures.",
-    ]
-    if style:
-        parts.append(f"Visual style: {style}.")
-    return " ".join([p for p in parts if p])
-
-
-def _historical_realism_rules(year: int) -> str:
-    flying_rule = (
-        "Before 2040 do not include any flying objects other than airplanes or helicopters; no drones, rockets, flying cars, blimps, balloons, or UFOs."
-        if year < 2040
-        else ""
-    )
-
-    if year <= 1850:
-        era = (
-            "No airplanes or motor vehicles. No rockets, electronics, neon, plastics, or skyscrapers. "
-            "Transportation is horse-drawn carts and carriages; steam trains only where plausible. Lighting is daylight or gaslight."
-        )
-    elif year <= 1900:
-        era = (
-            "No airplanes or modern automobiles. No rockets, electronics, neon, plastics, or skyscrapers. "
-            "Transportation includes horse-drawn vehicles and steam trains; very early bicycles and carriages are fine."
-        )
-    elif year <= 1945:
-        era = (
-            "Allow early automobiles and propeller aircraft. No jet aircraft, rockets, digital screens, or post‑war fashion/architecture."
-        )
-    elif year <= 1969:
-        era = (
-            "Allow jet aircraft and mid‑century tech. No personal computers, smartphones, LCD/LED screens, or ultra‑tall modern skylines."
-        )
-    elif year <= 1999:
-        era = (
-            "Allow CRT monitors, pagers, early mobile phones, and period‑appropriate cars. No smartphones, flat panels, or 21st‑century vehicles."
-        )
-    elif year <= 2039:
-        era = (
-            "Contemporary technology is acceptable; avoid widespread autonomous vehicles, mass flying devices, or space travel scenes."
-        )
-    else:
-        era = "Use technology and fashion authentic to the specified year; avoid items introduced after it."
-
-    return " ".join([p for p in [flying_rule, era] if p])
-
-
-def _development_scaling_guidance(year: int) -> str:
-    if year <= 1850:
-        return (
-            "Urban development is sparse. Small, low‑rise buildings (1–3 stories), narrow or dirt roads, limited signage, no cars."
-        )
-    if year <= 1900:
-        return (
-            "Low‑rise towns (2–4 stories), cobblestone or early paved roads, few industrial structures, minimal signage and infrastructure."
-        )
-    if year <= 1945:
-        return (
-            "Mostly low to mid‑rise (2–6 stories), early automobiles and trams, modest road widths, limited advertising, simpler materials."
-        )
-    if year <= 1969:
-        return (
-            "Mid‑century scale: mid‑rise blocks, boxy cars, wider roads but not modern mega‑highways; restrained skylines."
-        )
-    if year <= 1999:
-        return (
-            "Growing density with some high‑rises, but overall smaller buildings and cars than modern day; CRT signage, fewer glass towers."
-        )
-    if year <= 2039:
-        return (
-            "Modern development with realistic density; avoid ultra‑tall futuristic megastructures or over‑dense sci‑fi skylines."
-        )
-    return "Scale density plausibly for the year and location."
-
-
-def _schedule_cleanup(paths, delay_seconds: int):
-    def _worker(ps, delay):
-        try:
-            time.sleep(delay)
-            for p in ps:
-                try:
-                    Path(p).unlink(missing_ok=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_worker, args=(list(paths), int(delay_seconds)), daemon=True)
-    t.start()
-
-
-# Guard to avoid multiple sweepers in dev reload scenarios
-_SWEEPER_STARTED = False
-
-
-def _start_periodic_sweeper(out_dir: str, ttl_seconds: int, interval_seconds: int):
-    global _SWEEPER_STARTED
-    if _SWEEPER_STARTED:
-        return
-
-    def _loop():
-        while True:
-            try:
-                _sweep_output_dir(out_dir, ttl_seconds)
-            except Exception:
-                pass
-            time.sleep(max(30, int(interval_seconds)))
-
-    t = threading.Thread(target=_loop, daemon=True)
-    t.start()
-    _SWEEPER_STARTED = True
-
-
-def _sweep_output_dir(out_dir: str, ttl_seconds: int):
-    now = time.time()
-    p = Path(out_dir)
-    if not p.exists():
-        return
-    for fp in p.iterdir():
-        try:
-            if not fp.is_file():
-                continue
-            age = now - fp.stat().st_mtime
-            if age > ttl_seconds:
-                fp.unlink(missing_ok=True)
-        except Exception:
-            # ignore and continue
-            pass
-
-
-def _generate_and_save(prompt: str, n: int, image_size: str, model_name: str, out_dir: str):
-    api_key = os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not set")
-
-    # Prefer new google-genai client
-    if _GENAI_MODE == "google-genai" and genai is not None:
-        client = genai.Client(api_key=api_key)
-        saved_files = []
-        # Generate one image per call for reliability across SDK versions
-        cfg = genai_types.GenerateContentConfig(
-            response_modalities=["Text", "Image"]
-        ) if genai_types is not None else None
-
-        for _ in range(max(1, int(n))):
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=cfg,
-            )
-            parts = _extract_images_from_genai_response(response)
-            if not parts:
-                continue
-            saved_files.extend(_save_images_parts(parts[:1], out_dir))
-
-        if not saved_files:
-            raise RuntimeError("No images returned from model")
-        return saved_files
-
-    # Fallback to legacy google.generativeai
-    if legacy_genai is not None:
-        legacy_genai.configure(api_key=api_key)
-        model = legacy_genai.GenerativeModel(model_name=model_name)
-        result = model.generate_images(
-            prompt=prompt,
-            number_of_images=n,
-            size=image_size,
-        )
-        images = getattr(result, "images", [])
-        if not images:
-            raise RuntimeError("No images returned from model")
-        return _save_images_blob(images, out_dir)
-
-    raise RuntimeError(
-        "Neither 'google-genai' nor 'google.generativeai' is available. Install one to proceed."
-    )
-
-
-def _save_images_blob(images, out_dir: str):
-    saved = []
-    for img in images:
-        # Support both new and legacy clients
-        data = getattr(img, "data", None) or getattr(img, "_image_bytes", None) or getattr(img, "image_bytes", None)
-        if data is None:
-            raise RuntimeError("Unrecognized image object: missing bytes")
-        # Decide extension from mime if available
-        mime = getattr(img, "mime_type", None) or getattr(img, "mime", None) or "image/png"
-        ext = "png" if "png" in mime else ("jpg" if "jpeg" in mime or "jpg" in mime else "png")
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        path = Path(out_dir) / filename
-        with open(path, "wb") as f:
-            f.write(data)
-        saved.append(str(path))
-    return saved
-
-
-def _save_images_parts(parts, out_dir: str):
-    saved = []
-    for p in parts:
-        data = p.get("data")
-        mime = p.get("mime") or "image/png"
-        if isinstance(data, str):
-            # Some SDKs return base64-encoded strings for inline_data
-            try:
-                data = base64.b64decode(data)
-            except Exception:
-                # If not base64, assume raw bytes in latin-1
-                data = data.encode("latin-1", errors="ignore")
-        if not isinstance(data, (bytes, bytearray)):
-            raise RuntimeError("Image bytes are not in a supported format")
-
-        ext = "png" if "png" in mime else ("jpg" if "jpeg" in mime or "jpg" in mime else "png")
-        filename = f"{uuid.uuid4().hex}.{ext}"
-        path = Path(out_dir) / filename
-        with open(path, "wb") as f:
-            f.write(data)
-        saved.append(str(path))
-    return saved
-
-
-def _extract_images_from_genai_response(response):
-    parts_out = []
-    # Direct images attribute if present
-    images = getattr(response, "images", None)
-    if images:
-        for img in images:
-            data = getattr(img, "data", None) or getattr(img, "image_bytes", None) or getattr(img, "_image_bytes", None)
-            mime = getattr(img, "mime_type", None) or getattr(img, "mime", None) or "image/png"
-            if data:
-                parts_out.append({"data": data, "mime": mime})
-
-    # Candidates -> content -> parts
-    candidates = getattr(response, "candidates", None) or []
-    for cand in candidates:
-        content = getattr(cand, "content", None)
-        if not content:
-            continue
-        parts = getattr(content, "parts", None) or []
-        for p in parts:
-            # Try inline_data
-            inline = getattr(p, "inline_data", None)
-            if inline is not None:
-                data = getattr(inline, "data", None)
-                mime = getattr(inline, "mime_type", None) or "image/png"
-                if data is not None:
-                    parts_out.append({"data": data, "mime": mime})
-                    continue
-            # Try image field
-            img = getattr(p, "image", None)
-            if img is not None:
-                data = getattr(img, "data", None)
-                mime = getattr(img, "mime_type", None) or "image/png"
-                if data is not None:
-                    parts_out.append({"data": data, "mime": mime})
-                    continue
-            # Fallback: part itself has data/mime
-            data = getattr(p, "data", None)
-            mime = getattr(p, "mime_type", None)
-            if data is not None and mime is not None:
-                parts_out.append({"data": data, "mime": mime})
-
-    return parts_out
-
-
 if __name__ == "__main__":  # pragma: no cover
-    app = create_app()
-    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8000")))
+    parser = argparse.ArgumentParser(description="Run the Story Spark server")
+    parser.add_argument("--model", choices=["veo"], help="Enable video teaser generation via FAL.ai Veo3")
+    args = parser.parse_args()
+
+    enable_veo = (os.environ.get("ENABLE_VEO") or "").lower() in {"1", "true", "yes"} or (args.model == "veo")
+    app = create_app(enable_veo=enable_veo)
+    app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8002")))
