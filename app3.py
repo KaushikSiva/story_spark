@@ -1022,6 +1022,33 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
 
 def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> str:
     """Build an effective prompt for video generation"""
+    import re
+    
+    # Sanitize synopsis to avoid content policy violations
+    def sanitize_synopsis(text: str) -> str:
+        # List of potentially problematic terms that trigger content policy
+        problematic_terms = [
+            r'demonic?\s+possession', r'evil', r'malicious\s+spirit', r'paranormal', 
+            r'horror', r'demon', r'supernatural', r'occult', r'exorcism',
+            r'stag\s+party', r'bachelor\s+party', r'wild.*party', r'drinking', 
+            r'drunk', r'alcohol', r'drug', r'substance', r'hangover',
+            r'Las\s+Vegas', r'casino', r'gambling', r'strip\s+club'
+        ]
+        
+        sanitized = text
+        for term in problematic_terms:
+            sanitized = re.sub(term, '', sanitized, flags=re.IGNORECASE)
+        
+        # Clean up extra spaces and punctuation
+        sanitized = re.sub(r'\s+', ' ', sanitized).strip()
+        sanitized = re.sub(r'[,;]\s*[,;]', ',', sanitized)
+        
+        # If synopsis becomes too short after sanitization, use generic description
+        if len(sanitized.strip()) < 50:
+            return "A group of friends embark on an adventure that leads to unexpected challenges and discoveries."
+            
+        return sanitized
+    
     prompt_parts = [
         f"Create a cinematic {duration}-second movie teaser trailer.",
         "High production value with dramatic lighting and professional cinematography.",
@@ -1033,8 +1060,9 @@ def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> st
     if title:
         prompt_parts.append(f"Movie title context: {title}")
     
-    # Add synopsis context
-    prompt_parts.append(f"Story context: {synopsis}")
+    # Add sanitized synopsis context
+    sanitized_synopsis = sanitize_synopsis(synopsis)
+    prompt_parts.append(f"Story context: {sanitized_synopsis}")
     
     # Add teaser-specific direction
     prompt_parts.extend([
