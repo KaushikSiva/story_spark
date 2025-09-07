@@ -126,10 +126,21 @@ def create_app() -> Flask:
                 n = 8
             # Character reference handling: derive from generated JSON only
             character_target = int(payload.get("num_characters", 1) or 1)
+            log.info(
+                "character_target=%s; preparing reference images from %s (k=%s)",
+                character_target,
+                app.config["PEOPLE_DIR"],
+                character_target + 4,
+            )
             reference_parts = load_reference_image_parts(
                 people_dir=app.config["PEOPLE_DIR"],
                 k=character_target + 4,
             )
+            try:
+                # Log the effective count we will attach to Gemini
+                log.info("gemini reference count=%s", len(reference_parts))
+            except Exception:
+                pass
             try:
                 files = generate_images_from_synopsis(
                     synopsis=payload["synopsis"],
@@ -591,12 +602,24 @@ def load_reference_image_parts(*, people_dir: str, k: int) -> list:
     try:
         p = Path(people_dir)
         if not p.exists() or not p.is_dir():
+            try:
+                logging.getLogger(__name__).info(
+                    "PEOPLE_DIR missing or not a directory: %s (no references)", people_dir
+                )
+            except Exception:
+                pass
             return []
         all_files = [
             f for f in p.iterdir()
             if f.is_file() and f.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
         ]
         if not all_files:
+            try:
+                logging.getLogger(__name__).info(
+                    "PEOPLE_DIR has no supported image files: %s", people_dir
+                )
+            except Exception:
+                pass
             return []
         import random as _rnd
         chosen = _rnd.sample(all_files, k=min(len(all_files), max(1, int(k))))
