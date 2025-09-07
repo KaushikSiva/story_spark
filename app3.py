@@ -8,6 +8,8 @@ from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 import requests
 from pathlib import Path
+from PIL import Image
+import uuid
 
 
 load_dotenv()
@@ -132,6 +134,13 @@ def create_app() -> Flask:
                     }
                     for f in files
                 ]
+                # Also create a stitched collage image combining all parts into one
+                stitched = stitch_images_grid(files, out_dir=app.config["OUTPUT_DIR"], tile_size=512)
+                if stitched:
+                    payload["stitched_image"] = {
+                        "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}",
+                        "filename": Path(stitched).name,
+                    }
             except Exception as e:  # pragma: no cover
                 # Do not fail the whole request; just omit images
                 logging.getLogger(__name__).warning("image generation failed: %s", e)
@@ -429,7 +438,7 @@ def build_images_prompt_from_synopsis(synopsis: str, n: int) -> str:
         f"Tell the story purely through imagery with no words or text on the images. "
         f"Keep characters, setting, and styling consistent across all {n} images.\n\n"
         f"Synopsis:\n{synopsis.strip()}\n\n"
-        f"Output: {n} distinct images, one for each part."
+        f"Output: 1 distinct image, stitching together {n} parts."
     )
 
 
@@ -466,7 +475,7 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     saved = _save_images_parts(parts[:n], out_dir) if parts else []
 
     # If batch call returned fewer than requested, try per-line generation
-    if len(saved) < n:
+    if len(saved) < 1:
         lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
         for ln in lines:
             if len(saved) >= n:
@@ -553,6 +562,76 @@ def _save_images_parts(parts, out_dir: str):
             f.write(data)
         saved.append(str(path))
     return saved
+
+
+def stitch_images_grid(files: list[str], *, out_dir: str, cols: int | None = None, rows: int | None = None, tile_size: int = 512, bg_color: tuple[int, int, int] = (0, 0, 0)) -> str | None:
+    images: list[Image.Image] = []
+    for fp in files:
+        try:
+            im = Image.open(fp).convert("RGB")
+            images.append(im)
+        except Exception:
+            continue
+    if not images:
+        return None
+    n = len(images)
+    if cols is None or rows is None:
+        # Choose a pleasant grid for common counts
+        grid_map = {
+            1: (1, 1),
+            2: (2, 1),
+            3: (3, 1),
+            4: (2, 2),
+            5: (3, 2),
+            6: (3, 2),
+            7: (4, 2),
+            8: (4, 2),
+            9: (3, 3),
+            10: (4, 3),
+            11: (4, 3),
+            12: (4, 3),
+        }
+        if n in grid_map:
+            cols_calc, rows_calc = grid_map[n]
+        else:
+            import math
+            cols_calc = int(math.ceil(math.sqrt(n)))
+            rows_calc = int(math.ceil(n / max(1, cols_calc)))
+        cols, rows = cols_calc, rows_calc
+    cols = max(1, int(cols))
+    rows = max(1, int(rows))
+
+    # Normalize to uniform thumbnails
+    thumbs: list[Image.Image] = []
+    for im in images[: cols * rows]:
+        # Preserve aspect ratio within tile bounds, then letterbox on background
+        tw = th = int(tile_size)
+        im2 = im.copy()
+        im2.thumbnail((tw, th), Image.LANCZOS)
+        canvas = Image.new("RGB", (tw, th), bg_color)
+        x = (tw - im2.width) // 2
+        y = (th - im2.height) // 2
+        canvas.paste(im2, (x, y))
+        thumbs.append(canvas)
+
+    width = cols * tile_size
+    height = rows * tile_size
+    collage = Image.new("RGB", (width, height), bg_color)
+    i = 0
+    for r in range(rows):
+        for c in range(cols):
+            if i >= len(thumbs):
+                break
+            collage.paste(thumbs[i], (c * tile_size, r * tile_size))
+            i += 1
+
+    out_name = f"{uuid.uuid4().hex}.jpg"
+    out_path = str(Path(out_dir) / out_name)
+    try:
+        collage.save(out_path, format="JPEG", quality=90)
+        return out_path
+    except Exception:
+        return None
 
 
 def _strip_llm_artifacts(text: str) -> str:
