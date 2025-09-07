@@ -40,7 +40,7 @@ python storybook.py
 
 - API: http://localhost:8001/api/storyboard
 - Dev UI: `cd static/ui/story_book && npm install && npm run dev` → http://localhost:5173/
-- Prod UI: `npm run build`, then http://localhost:8001/storybook
+- To test: `npm run build`, then http://localhost:8001/storybook
 
 ## Movie API (movie.py)
 
