@@ -12,12 +12,22 @@ import requests
 load_dotenv()
 
 
+try:
+    from google import genai  # type: ignore
+    from google.genai import types as genai_types  # type: ignore
+    _GENAI_AVAILABLE = True
+except Exception:  # pragma: no cover
+    genai = None
+    genai_types = None
+    _GENAI_AVAILABLE = False
+
+
 def create_app() -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder="static", static_url_path="/static")
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
 
-    # Reuse the same LLM config style as app2.py
+    # Reuse the same LLM config style as app2.py and add image-gen settings
     app.config.update(
         CORS_ALLOW_ORIGINS=os.environ.get("CORS_ALLOW_ORIGINS", "*"),
         LLM_BASE_URL=os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
@@ -27,7 +37,16 @@ def create_app() -> Flask:
         LLM_API_STYLE=os.environ.get("LLM_API_STYLE", "auto"),  # auto|chat|completions
         LLM_CHAT_PATH=os.environ.get("LLM_CHAT_PATH", "/chat/completions"),
         LLM_COMPLETIONS_PATH=os.environ.get("LLM_COMPLETIONS_PATH", "/completions"),
+        OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
+        IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "nano-banana"),  # requested model
     )
+
+    # Ensure output path exists
+    try:
+        from pathlib import Path
+        Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
     @app.after_request
     def add_cors_headers(resp):  # pragma: no cover
@@ -90,6 +109,34 @@ def create_app() -> Flask:
             "genre": result.get("genre", ""),
             "source": source,
         }
+        # Optional: generate images from synopsis (default ON). Disable with generate_images=0/false/no
+        flag_raw = (request.args.get("generate_images") or request.args.get("images"))
+        gen_images_flag = True if flag_raw is None else (str(flag_raw).lower() not in {"0", "false", "no"})
+        if gen_images_flag:
+            try:
+                n_param = request.args.get("n")
+                n = int(n_param) if n_param is not None else 8
+                n = max(1, min(12, n))
+            except Exception:
+                n = 8
+            try:
+                files = generate_images_from_synopsis(
+                    synopsis=payload["synopsis"],
+                    model_name=app.config["IMAGE_STORY_MODEL"],
+                    out_dir=app.config["OUTPUT_DIR"],
+                    n=n,
+                )
+                base_url = request.url_root.rstrip("/")
+                payload["images"] = [
+                    {
+                        "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}",
+                        "filename": Path(f).name,
+                    }
+                    for f in files
+                ]
+            except Exception as e:  # pragma: no cover
+                # Do not fail the whole request; just omit images
+                logging.getLogger(__name__).warning("image generation failed: %s", e)
         return jsonify(payload)
 
     return app
@@ -375,6 +422,106 @@ def _fallback_poster(*, title: str | None, genre: str | None, synopsis: str | No
         "num_characters": 1,
         "genre": g,
     }
+
+
+def build_images_prompt_from_synopsis(synopsis: str, n: int) -> str:
+    n = max(1, n)
+    return (
+        f"Create a beautifully entertaining {n} part story with {n} images inspired by the following movie synopsis. "
+        f"Tell the story purely through imagery with no words or text on the images. "
+        f"Keep characters, setting, and styling consistent across all {n} images.\n\n"
+        f"Synopsis:\n{synopsis.strip()}\n\n"
+        f"Output: {n} distinct images, one for each part."
+    )
+
+
+def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: str, n: int = 8) -> list[str]:
+    if not _GENAI_AVAILABLE:
+        raise RuntimeError("google-genai is not installed")
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not set")
+
+    client = genai.Client(api_key=api_key)
+    cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
+
+    prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=cfg,
+    )
+
+    parts = _extract_images_from_genai_response(response)
+    if not parts:
+        raise RuntimeError("No images returned for synopsis prompt")
+    # Save up to n images
+    saved = _save_images_parts(parts[:n], out_dir)
+    return saved
+
+
+def _extract_images_from_genai_response(response):
+    parts_out = []
+    images = getattr(response, "images", None)
+    if images:
+        for img in images:
+            data = getattr(img, "data", None) or getattr(img, "image_bytes", None) or getattr(img, "_image_bytes", None)
+            mime = getattr(img, "mime_type", None) or getattr(img, "mime", None) or "image/png"
+            if data is not None:
+                parts_out.append({"data": data, "mime": mime})
+
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        if not content:
+            continue
+        parts = getattr(content, "parts", None) or []
+        for p in parts:
+            inline = getattr(p, "inline_data", None)
+            if inline is not None:
+                data = getattr(inline, "data", None)
+                mime = getattr(inline, "mime_type", None) or "image/png"
+                if data is not None:
+                    parts_out.append({"data": data, "mime": mime})
+                    continue
+            img = getattr(p, "image", None)
+            if img is not None:
+                data = getattr(img, "data", None)
+                mime = getattr(img, "mime_type", None) or "image/png"
+                if data is not None:
+                    parts_out.append({"data": data, "mime": mime})
+                    continue
+            data = getattr(p, "data", None)
+            mime = getattr(p, "mime_type", None)
+            if data is not None and mime is not None:
+                parts_out.append({"data": data, "mime": mime})
+
+    return parts_out
+
+
+def _save_images_parts(parts, out_dir: str):
+    from pathlib import Path
+    import base64
+    import uuid
+    saved = []
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    for p in parts:
+        data = p.get("data")
+        mime = p.get("mime") or "image/png"
+        if isinstance(data, str):
+            try:
+                data = base64.b64decode(data)
+            except Exception:
+                data = data.encode("latin-1", errors="ignore")
+        if not isinstance(data, (bytes, bytearray)):
+            continue
+        ext = "png" if "png" in mime else ("jpg" if "jpeg" in mime or "jpg" in mime else "png")
+        filename = f"{uuid.uuid4().hex}.{ext}"
+        path = Path(out_dir) / filename
+        with open(path, "wb") as f:
+            f.write(data)
+        saved.append(str(path))
+    return saved
 
 
 def _strip_llm_artifacts(text: str) -> str:
