@@ -1,0 +1,6 @@
+{
+"model": "openai/gpt-oss-20b",
+"prompt": "Return ONLY JSON: {"scenes":[{"text":"One."},{"text":"Two."},{"text":"Three."},{"text":"Four."},{"text":"Five."}]}",
+"max_tokens": 300,
+"temperature": 0.2
+}

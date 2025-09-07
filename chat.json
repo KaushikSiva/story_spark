@@ -1,0 +1,9 @@
+{
+"model": "openai/gpt-oss-20b",
+"messages": [
+{"role":"system","content":"Return ONLY a JSON object with five scenes: {"scenes":[{"text":"..."},...]}. Nothing else."},
+{"role":"user","content":"Theme: friendship of two animals"}
+],
+"temperature": 0.2,
+"max_tokens": 300
+}
