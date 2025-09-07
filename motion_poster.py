@@ -11,11 +11,11 @@ def build_images_prompt_from_synopsis(synopsis: str, n: int, *, character_target
     ct = int(character_target) if character_target is not None else None
     # Default template includes character reference guidance
     default = (
-        "Create a beautifully entertaining {n} part story with {n} narrative beats inspired by the following movie synopsis. "
+        "Create a beautifully entertaining {n} part story with {n} images inspired by the following movie synopsis. "
         "Tell the story purely through imagery with no words or text on the images. "
-        "Keep characters, setting, and styling consistent across all parts. {ref_note}\n\n"
+        "Keep characters, setting, and styling consistent across all {n} images. {ref_note}\n\n"
         "Synopsis:\n{synopsis}\n\n"
-        "Output: Create a single, coherent image that visually stitches together all {n} parts into one cinematic collage."
+        "Output: {n} distinct images, one for each part."
     )
     tmpl = _get_template("STORY_IMAGES_PROMPT_TEMPLATE", default)
     ref_note = (
@@ -33,6 +33,7 @@ def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno", *, c
         "Director credit: Directed by {director}. "
         "Use the following synopsis to guide the imagery, characters, tone, and setting. "
         "CRITICAL: Match the same principal characters as shown in the provided reference photos and frames; keep face identity, hairstyle, and costume colors consistent. "
+        "Do NOT create a collage, grid, montage tiles, or multi‑panel layout; produce one cohesive, single‑image key art composition. "
         "If candidate human reference photos are provided, choose whichever best match up to {character_target} characters; "
         "if characters are non-human or references do not fit, ignore them and invent consistent characters. "
         "Include tasteful, legible on-poster text: the film title '{title}', the credit 'Directed by {director}', and 2–4 thematically appropriate character names you invent (avoid real IP). "
@@ -54,4 +55,3 @@ def load_reference_image_parts(*args, **kwargs):  # pragma: no cover
 def file_to_genai_part(*args, **kwargs):  # pragma: no cover
     from app3 import file_to_genai_part as _impl
     return _impl(*args, **kwargs)
-

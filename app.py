@@ -2,6 +2,8 @@ import os
 import argparse
 import logging
 from pathlib import Path
+import re
+import uuid
 from datetime import datetime
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
@@ -129,32 +131,60 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             ref_parts = load_reference_image_parts(people_dir=app.config["PEOPLE_DIR"], k=character_target + 4)
             log.info("character_target=%s; reference_count=%s", character_target, len(ref_parts))
 
+            # Per-generation output directory named after title (slug)
+            def _slugify(title_str: str) -> str:
+                s = (title_str or "Untitled").lower().strip()
+                s = re.sub(r"[^a-z0-9]+", "-", s)
+                s = re.sub(r"-+", "-", s).strip("-")
+                return s or "untitled"
+
+            base_slug = _slugify(payload.get("title") or "Untitled")
+            base_out = Path(app.config["OUTPUT_DIR"]) / base_slug
+            run_path = base_out
+            # If folder exists, override by clearing it
+            if run_path.exists():
+                try:
+                    import shutil
+                    shutil.rmtree(run_path)
+                except Exception:
+                    pass
+            run_path.mkdir(parents=True, exist_ok=True)
+            run_dir = run_path.name
+            out_dir = str(run_path)
+            payload["run_dir"] = run_dir
+
             try:
                 files = generate_images_from_synopsis(
                     synopsis=payload["synopsis"],
                     model_name=app.config["IMAGE_STORY_MODEL"],
-                    out_dir=app.config["OUTPUT_DIR"],
+                    out_dir=out_dir,
                     n=n,
                     reference_parts=ref_parts,
                     character_target=character_target,
                 )
+                log.info("saved scenes to out_dir=%s files=%s", out_dir, [Path(f).name for f in files])
                 base_url = request.url_root.rstrip("/")
-                payload["images"] = [{"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}", "filename": Path(f).name} for f in files]
+                payload["images"] = []
+                for f in files:
+                    rel = str(Path(f).relative_to(app.config["OUTPUT_DIR"]))
+                    payload["images"].append({
+                        "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}",
+                        "filename": rel,
+                    })
 
                 # stitched (fixed name)
-                stitched = stitch_images_grid(files, out_dir=app.config["OUTPUT_DIR"], tile_size=512, fixed_name="stitched.jpg")
+                stitched = stitch_images_grid(files, out_dir=out_dir, tile_size=512, fixed_name="stitched.jpg")
                 if stitched:
-                    payload["stitched_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}", "filename": Path(stitched).name}
+                    rels = str(Path(stitched).relative_to(app.config["OUTPUT_DIR"]))
+                    payload["stitched_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rels}", "filename": rels}
+                    log.info("stitched collage saved to %s", rels)
 
-                # poster (use story frames + stitched as extra refs)
+                # poster (use people refs + a single story frame for identity; avoid stitched collage)
                 extra_refs = []
                 try:
-                    for fp in files[:2]:
-                        p = file_to_genai_part(fp)
-                        if p is not None:
-                            extra_refs.append(p)
-                    if stitched:
-                        p = file_to_genai_part(stitched)
+                    # Just one representative frame to nudge identity, not layout
+                    if files:
+                        p = file_to_genai_part(files[0])
                         if p is not None:
                             extra_refs.append(p)
                 except Exception:
@@ -165,13 +195,15 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                     synopsis=payload["synopsis"],
                     director="Bruno",
                     model_name=app.config["IMAGE_STORY_MODEL"],
-                    out_dir=app.config["OUTPUT_DIR"],
+                    out_dir=out_dir,
                     reference_parts=strong_refs,
                     character_target=character_target,
                     fixed_name="first_look",
                 )
                 if poster_file:
-                    payload["poster_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(poster_file).name}", "filename": Path(poster_file).name}
+                    relp = str(Path(poster_file).relative_to(app.config["OUTPUT_DIR"]))
+                    payload["poster_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{relp}", "filename": relp}
+                    log.info("poster saved to %s", relp)
             except Exception as e:  # pragma: no cover
                 log.warning("image generation failed: %s", e)
 
@@ -239,7 +271,9 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         if not synopsis:
             return jsonify({"error": "synopsis required", "details": "No cached synopsis found."}), 400
 
-        out_dir = app.config.get("OUTPUT_DIR", "static/generated")
+        base_out = app.config.get("OUTPUT_DIR", "static/generated")
+        run_dir = last_payload.get("run_dir")
+        out_dir = str(Path(base_out) / run_dir) if run_dir else base_out
         poster_path = get_first_look_path(out_dir)
         if not poster_path:
             return jsonify({"error": "poster not found", "details": "Generate a poster first via /api/motion_poster."}), 400
@@ -274,12 +308,17 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 character_target=character_target,
             )
             base_url = request.url_root.rstrip("/")
-            images = [{"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(f).name}", "filename": Path(f).name} for f in files]
+            images = []
+            for f in files:
+                rel = str(Path(f).relative_to(app.config["OUTPUT_DIR"]))
+                images.append({"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}", "filename": rel})
             stitched = stitch_images_grid(files, out_dir=out_dir, tile_size=512, fixed_name="stitched.jpg")
             stitched_info = None
             if stitched:
-                stitched_info = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}", "filename": Path(stitched).name}
+                rels = str(Path(stitched).relative_to(app.config["OUTPUT_DIR"]))
+                stitched_info = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rels}", "filename": rels}
             new_payload = dict(last_payload)
+            new_payload["run_dir"] = run_dir or new_payload.get("run_dir")
             new_payload["images"] = images
             if stitched_info:
                 new_payload["stitched_image"] = stitched_info

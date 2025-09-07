@@ -73,6 +73,46 @@ def save_images_parts(parts: list[dict], out_dir: str) -> list[str]:
     return saved
 
 
+def _ext_from_mime(mime: str) -> str:
+    m = (mime or "image/jpeg").lower()
+    if "png" in m:
+        return "png"
+    if "jpeg" in m or "jpg" in m:
+        return "jpg"
+    if "webp" in m:
+        return "webp"
+    return "jpg"
+
+
+def save_images_parts_with_pattern(parts: list[dict], out_dir: str, *, pattern: str = "scene_{i}.{ext}", start_index: int = 1, overwrite: bool = True) -> list[str]:
+    saved: list[str] = []
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    idx = int(start_index)
+    for p in parts:
+        data = p.get("data")
+        mime = p.get("mime") or "image/jpeg"
+        if isinstance(data, str):
+            try:
+                data = base64.b64decode(data)
+            except Exception:
+                data = data.encode("latin-1", errors="ignore")
+        if not isinstance(data, (bytes, bytearray)):
+            continue
+        ext = _ext_from_mime(mime)
+        filename = pattern.format(i=idx, ext=ext)
+        path = Path(out_dir) / filename
+        if overwrite:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        with open(path, "wb") as f:
+            f.write(data)
+        saved.append(str(path))
+        idx += 1
+    return saved
+
+
 def save_image_part_fixed(part: dict, *, out_dir: str, base_name: str) -> str:
     data = part.get("data")
     mime = (part.get("mime") or "image/jpeg").lower()
@@ -199,4 +239,3 @@ def file_to_genai_part(path: str):
             return {"inline_data": {"data": base64.b64encode(data).decode("ascii"), "mime_type": mime}}
     except Exception:
         return None
-

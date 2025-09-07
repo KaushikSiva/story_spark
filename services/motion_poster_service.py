@@ -9,7 +9,7 @@ import requests
 
 from image_utils import (
     extract_images_from_genai_response,
-    save_images_parts,
+    save_images_parts_with_pattern,
     save_image_part_fixed,
 )
 
@@ -338,8 +338,14 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
             raise
 
     parts = extract_images_from_genai_response(response)
-    saved = save_images_parts(parts[:n], out_dir) if parts else []
-    if not saved:
+    saved = []
+    next_idx = 1
+    if parts:
+        batch = save_images_parts_with_pattern(parts[:n], out_dir, pattern="scene_{i}.{ext}", start_index=next_idx)
+        saved.extend(batch)
+        next_idx += len(batch)
+    # If fewer than requested, fall back per-line to reach n
+    if len(saved) < n:
         # Per-line retry to salvage at least one
         lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
         for ln in lines:
@@ -358,7 +364,9 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
                 r = _call(fb, contents2)
             more = extract_images_from_genai_response(r)
             if more:
-                saved.extend(save_images_parts(more[:1], out_dir))
+                batch = save_images_parts_with_pattern(more[:1], out_dir, pattern="scene_{i}.{ext}", start_index=next_idx)
+                saved.extend(batch)
+                next_idx += len(batch)
     if not saved:
         raise RuntimeError("No images returned for synopsis prompt")
     return saved[:n]
@@ -411,4 +419,3 @@ def get_first_look_path(out_dir: str) -> str | None:
         if fp.exists() and fp.is_file():
             return str(fp)
     return None
-

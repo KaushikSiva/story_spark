@@ -40,7 +40,7 @@ def sanitize_synopsis(text: str) -> str:
     return sanitized
 
 
-def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int) -> Dict[str, Any]:
+def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int, output_dir: str = "static/generated") -> Dict[str, Any]:
     log = logging.getLogger(__name__)
     if not fal_api_key:
         raise RuntimeError("FAL_API_KEY not set")
@@ -126,15 +126,15 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
     # Direct video url
     if "video" in result and "url" in result["video"]:
         video_url = result["video"]["url"]
-        local_file = download_video_file(video_url, "static/generated")
+        local_file = download_video_file(video_url, output_dir)
         return {"video_url": video_url, "local_file": local_file, "duration": duration_effective, "prompt": prompt, "model": model, "status": "completed"}
     elif "request_id" in result:
-        return poll_video_completion(result["request_id"], fal_api_key, model, timeout)
+        return poll_video_completion(result["request_id"], fal_api_key, model, timeout, output_dir)
     else:
         raise RuntimeError(f"Unexpected response format: {result}")
 
 
-def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout: int) -> Dict[str, Any]:
+def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout: int, output_dir: str) -> Dict[str, Any]:
     import time
     headers = {"Authorization": f"Key {fal_api_key}"}
     status_url = f"https://fal.run/{model}/requests/{request_id}"
@@ -148,7 +148,7 @@ def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout
             if status == "completed":
                 if "video" in result and "url" in result["video"]:
                     video_url = result["video"]["url"]
-                    local_file = download_video_file(video_url, "static/generated")
+                    local_file = download_video_file(video_url, output_dir)
                     return {"video_url": video_url, "local_file": local_file, "duration": result.get("duration", 8), "model": model, "status": "completed", "request_id": request_id}
                 else:
                     raise RuntimeError("Video completed but no URL found in response")
@@ -178,4 +178,3 @@ def download_video_file(video_url: str, output_dir: str) -> str:
             if chunk:
                 f.write(chunk)
     return str(filepath)
-
