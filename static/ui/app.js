@@ -1,6 +1,17 @@
 const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 
+function addCacheBust(url) {
+  try {
+    const u = new URL(url, window.location.origin);
+    u.searchParams.set('cb', String(Date.now()));
+    return u.toString();
+  } catch {
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}cb=${Date.now()}`;
+  }
+}
+
 function qs(params) {
   const sp = new URLSearchParams();
   Object.entries(params).forEach(([k, v]) => {
@@ -47,6 +58,7 @@ function renderResult(container, data) {
 
   // Cache for video step and toggle UI
   LAST_RESULT = data;
+  try { localStorage.setItem('last_result', JSON.stringify(data)); } catch {}
   const hasStitched = !!(data.stitched_image && data.stitched_image.url);
   const hasPoster = !!(data.poster_image && data.poster_image.url);
   const videoTools = document.getElementById("video-tools");
@@ -68,7 +80,7 @@ function renderResult(container, data) {
 }
 
 function renderImgCard(title, obj) {
-  const url = obj.url || "";
+  const url = addCacheBust(obj.url || "");
   const filename = obj.filename || "";
   return `
     <figure class="card media-card">
@@ -79,7 +91,7 @@ function renderImgCard(title, obj) {
 }
 
 function renderImage(obj) {
-  const url = obj.url || "";
+  const url = addCacheBust(obj.url || "");
   const filename = obj.filename || "";
   return `
     <a class="img" href="${encodeURI(url)}" target="_blank" rel="noopener">
@@ -124,6 +136,7 @@ async function handleSubmit(e) {
     if (!res.ok) throw new Error(`Request failed: ${res.status}`);
     const data = await res.json();
     renderResult(result, data);
+    try { localStorage.setItem('last_result', JSON.stringify(data)); } catch {}
     result.classList.remove("hidden");
     status.textContent = "Done";
   } catch (err) {
@@ -138,6 +151,18 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnVideo) btnVideo.addEventListener("click", handleGenerateVideo);
   const btnResync = document.getElementById("btn-resync");
   if (btnResync) btnResync.addEventListener("click", handleResyncWithPoster);
+  const btnClear = document.getElementById("btn-clear");
+  if (btnClear) btnClear.addEventListener("click", handleClear);
+  // Restore last result on refresh
+  try {
+    const raw = localStorage.getItem('last_result');
+    if (raw) {
+      const data = JSON.parse(raw);
+      const result = document.getElementById('result');
+      renderResult(result, data);
+      result.classList.remove('hidden');
+    }
+  } catch {}
 });
 
 async function handleGenerateVideo() {
@@ -175,6 +200,14 @@ async function handleGenerateVideo() {
       throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
     }
     renderVideo(out, data);
+    try {
+      const last = localStorage.getItem('last_result');
+      if (last) {
+        const parsed = JSON.parse(last);
+        parsed.teaser = data.url || data.local_file || '';
+        localStorage.setItem('last_result', JSON.stringify(parsed));
+      }
+    } catch {}
     out.classList.remove("hidden");
     status.textContent = "Done";
   } catch (e) {
@@ -186,7 +219,7 @@ async function handleGenerateVideo() {
 }
 
 function renderVideo(container, data) {
-  const url = data.url || (data.local_file ? `/static/generated/${data.local_file.split('/').pop()}` : "");
+  const url = addCacheBust(data.url || (data.local_file ? `/static/generated/${data.local_file.split('/').pop()}` : ""));
   const remote = data.video_url || "";
   const prompt = data.prompt || "";
   const model = data.model || "";
@@ -201,6 +234,29 @@ function renderVideo(container, data) {
       ${model ? `<span class="pill alt">${escapeHtml(model)}</span>` : ""}
     </div>
   `;
+}
+
+function handleClear() {
+  try { localStorage.removeItem('last_result'); } catch {}
+  LAST_RESULT = null;
+  const result = document.getElementById('result');
+  if (result) {
+    result.innerHTML = '';
+    result.classList.add('hidden');
+  }
+  const videoOut = document.getElementById('video-out');
+  if (videoOut) {
+    videoOut.innerHTML = '';
+    videoOut.classList.add('hidden');
+  }
+  const status = document.getElementById('status');
+  if (status) status.textContent = '';
+  const vStatus = document.getElementById('video-status');
+  if (vStatus) vStatus.textContent = '';
+  const btnVideo = document.getElementById('btn-video');
+  if (btnVideo) btnVideo.disabled = true;
+  const btnResync = document.getElementById('btn-resync');
+  if (btnResync) btnResync.disabled = true;
 }
 
 async function handleResyncWithPoster() {
