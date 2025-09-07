@@ -6,6 +6,9 @@ from typing import Dict, Any
 import requests
 
 from video_teaser import build_video_prompt_base, build_video_prompt_safe_suffix
+from pathlib import Path
+import os
+import logging
 
 
 def build_video_prompt(*, title: str | None, synopsis: str, duration: int, safe: bool = False, style: str | None = None) -> str:
@@ -52,7 +55,7 @@ def sanitize_synopsis(text: str) -> str:
     return sanitized
 
 
-def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int, output_dir: str = "static/generated", style: str | None = None) -> Dict[str, Any]:
+def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int, output_dir: str = "static/generated", style: str | None = None, append_extras: bool = True) -> Dict[str, Any]:
     log = logging.getLogger(__name__)
     if not fal_api_key:
         raise RuntimeError("FAL_API_KEY not set")
@@ -139,9 +142,21 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
     if "video" in result and "url" in result["video"]:
         video_url = result["video"]["url"]
         local_file = download_video_file(video_url, output_dir)
+        if append_extras:
+            try:
+                local_file = _append_poster_and_tag(local_file, output_dir)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"postprocess teaser failed: {e}")
         return {"video_url": video_url, "local_file": local_file, "duration": duration_effective, "prompt": prompt, "model": model, "status": "completed"}
     elif "request_id" in result:
-        return poll_video_completion(result["request_id"], fal_api_key, model, timeout, output_dir)
+        data = poll_video_completion(result["request_id"], fal_api_key, model, timeout, output_dir)
+        if append_extras:
+            try:
+                if data.get("local_file"):
+                    data["local_file"] = _append_poster_and_tag(data["local_file"], output_dir)
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"postprocess teaser failed: {e}")
+        return data
     else:
         raise RuntimeError(f"Unexpected response format: {result}")
 
@@ -190,3 +205,76 @@ def download_video_file(video_url: str, output_dir: str) -> str:
             if chunk:
                 f.write(chunk)
     return str(filepath)
+
+
+def _append_poster_and_tag(video_path: str, output_dir: str) -> str:
+    """Append first look poster and a 'coming soon' card to the teaser.
+    Returns the final video path (overwrites teaser.mp4).
+    """
+    try:
+        from moviepy.editor import VideoFileClip, ImageClip, ColorClip, CompositeVideoClip, concatenate_videoclips
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        # moviepy not available; skip
+        return video_path
+
+    vp = Path(video_path)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find poster image in output_dir
+    poster = None
+    for name in ("first_look.jpg", "first_look.png"):
+        p = out_dir / name
+        if p.exists():
+            poster = str(p)
+            break
+
+    base = VideoFileClip(str(vp))
+    w, h = base.w, base.h
+
+    clips = [base]
+
+    # Poster segment ~2.0s
+    if poster:
+        poster_clip = ImageClip(poster).set_duration(2.0)
+        poster_clip = poster_clip.resize(width=w).on_color(size=(w, h), color=(0, 0, 0), pos="center")
+        poster_clip = poster_clip.fadein(0.4).fadeout(0.3)
+        clips.append(poster_clip)
+
+    # Coming soon card ~2.0s with fade in
+    # Build a text image via PIL to avoid ImageMagick dependency
+    msg = "Coming soon to theatres near you…"
+    txt_img = Image.new("RGB", (w, h), (0, 0, 0))
+    draw = ImageDraw.Draw(txt_img)
+    try:
+        font = ImageFont.truetype("arial.ttf", size=int(h * 0.06))
+    except Exception:
+        font = ImageFont.load_default()
+    tw, th = draw.textbbox((0, 0), msg, font=font)[2:4]
+    draw.text(((w - tw) // 2, int(h * 0.45)), msg, font=font, fill=(255, 255, 255))
+    msg_path = out_dir / "_coming_soon.png"
+    try:
+        txt_img.save(msg_path)
+    except Exception:
+        pass
+    if msg_path.exists():
+        msg_clip = ImageClip(str(msg_path)).set_duration(2.0)
+        msg_clip = msg_clip.fadein(0.6)
+        clips.append(msg_clip)
+
+    final = concatenate_videoclips(clips, method="compose")
+    final_path = out_dir / "teaser.mp4"
+    # Overwrite teaser.mp4
+    tmp_path = out_dir / "_teaser_tmp.mp4"
+    final.write_videofile(str(tmp_path), codec="libx264", audio_codec="aac", fps=base.fps or 24, verbose=False, logger=None)
+    try:
+        if final_path.exists():
+            final_path.unlink()
+        tmp_path.rename(final_path)
+    finally:
+        try:
+            base.close()
+        except Exception:
+            pass
+    return str(final_path)

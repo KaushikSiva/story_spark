@@ -246,6 +246,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 timeout=app.config["VIDEO_TIMEOUT_SECONDS"],
                 output_dir=out_dir,
                 style=(request.args.get("style") or request.args.get("reference") or None),
+                append_extras=((request.args.get("append_extras") or "1").lower() not in {"0","false","no"}),
             )
             # attach convenience URL
             base_url = request.url_root.rstrip("/")
