@@ -7,6 +7,7 @@ from typing import Any, Dict, Tuple
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 import requests
+from pathlib import Path
 
 
 load_dotenv()
@@ -38,15 +39,12 @@ def create_app() -> Flask:
         LLM_CHAT_PATH=os.environ.get("LLM_CHAT_PATH", "/chat/completions"),
         LLM_COMPLETIONS_PATH=os.environ.get("LLM_COMPLETIONS_PATH", "/completions"),
         OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
-        IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "nano-banana"),  # requested model
+        IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
+        FALLBACK_IMAGE_MODEL=os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview"),
     )
 
     # Ensure output path exists
-    try:
-        from pathlib import Path
-        Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+    Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
 
     @app.after_request
     def add_cors_headers(resp):  # pragma: no cover
@@ -446,18 +444,51 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
 
     prompt = build_images_prompt_from_synopsis(_enforce_synopsis_lines(synopsis, genre=None), n)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=cfg,
-    )
+
+    def _call(model: str):
+        return client.models.generate_content(model=model, contents=prompt, config=cfg)
+
+    response = None
+    try:
+        response = _call(model_name)
+    except Exception as e:
+        msg = str(e).lower()
+        if any(tok in msg for tok in ["not_found", "404", "not found", "is not supported"]):
+            fb = os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview")
+            if model_name != fb:
+                response = _call(fb)
+            else:
+                raise
+        else:
+            raise
 
     parts = _extract_images_from_genai_response(response)
-    if not parts:
+    saved = _save_images_parts(parts[:n], out_dir) if parts else []
+
+    # If batch call returned fewer than requested, try per-line generation
+    if len(saved) < n:
+        lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
+        for ln in lines:
+            if len(saved) >= n:
+                break
+            single_prompt = (
+                "Create one cinematic image illustrating the following story beat. "
+                "Do not include any words or text on the image. Maintain consistent characters and setting.\n"
+                f"Beat: {ln}"
+            )
+            try:
+                r = client.models.generate_content(model=model_name, contents=single_prompt, config=cfg)
+            except Exception:
+                # fallback once
+                fb = os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview")
+                r = client.models.generate_content(model=fb, contents=single_prompt, config=cfg)
+            more = _extract_images_from_genai_response(r)
+            if more:
+                saved.extend(_save_images_parts(more[:1], out_dir))
+
+    if not saved:
         raise RuntimeError("No images returned for synopsis prompt")
-    # Save up to n images
-    saved = _save_images_parts(parts[:n], out_dir)
-    return saved
+    return saved[:n]
 
 
 def _extract_images_from_genai_response(response):
