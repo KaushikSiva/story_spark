@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import random
+import argparse
 from typing import Any, Dict, Tuple
 
 from flask import Flask, jsonify, request
@@ -26,10 +27,13 @@ except Exception:  # pragma: no cover
     _GENAI_AVAILABLE = False
 
 
-def create_app() -> Flask:
+def create_app(*, enable_veo: bool = False) -> Flask:
     app = Flask(__name__, static_folder="static", static_url_path="/static")
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
+    
+    # Cache for last motion poster response to avoid re-passing synopsis
+    _last_motion_poster = {}
 
     # Reuse the same LLM config style as app2.py and add image-gen settings
     app.config.update(
@@ -44,6 +48,9 @@ def create_app() -> Flask:
         OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
         IMAGE_STORY_MODEL=os.environ.get("IMAGE_STORY_MODEL", "models/gemini-2.5-flash-image-preview"),
         FALLBACK_IMAGE_MODEL=os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview"),
+        FAL_API_KEY=os.environ.get("FAL_API_KEY", ""),
+        FAL_VEO3_MODEL=os.environ.get("FAL_VEO3_MODEL", "fal-ai/veo3/image-to-video"),
+        VIDEO_TIMEOUT_SECONDS=int(os.environ.get("VIDEO_TIMEOUT_SECONDS", "300")),  # 5 minutes for video generation
         PEOPLE_DIR=os.environ.get("PEOPLE_DIR", "static/people"),
     )
 
@@ -193,7 +200,73 @@ def create_app() -> Flask:
             except Exception as e:  # pragma: no cover
                 # Do not fail the whole request; just omit images
                 logging.getLogger(__name__).warning("image generation failed: %s", e)
+        
+        # Cache this response for video teaser generation
+        _last_motion_poster.clear()
+        _last_motion_poster.update(payload)
+        
         return jsonify(payload)
+
+    @app.route("/api/video_teaser", methods=["GET", "OPTIONS"])
+    def video_teaser():
+        if request.method == "OPTIONS":
+            return ("", 204)
+
+        # Check if Veo model is enabled
+        if not enable_veo:
+            return jsonify({
+                "error": "Video teaser generation is disabled", 
+                "details": "Start the application with --model veo to enable video generation"
+            }), 503
+
+        # Get parameters from query string
+        title = (request.args.get("title") or "").strip() or None
+        synopsis = (request.args.get("synopsis") or "").strip() or None
+        stitched_image_url = (request.args.get("stitched_image_url") or "").strip() or None
+        duration = int(request.args.get("duration", 8))  # Default 8 seconds (FAL default)
+        
+        # Try to get synopsis from last motion_poster response if not provided
+        if not synopsis and _last_motion_poster:
+            synopsis = _last_motion_poster.get("synopsis")
+            title = title or _last_motion_poster.get("title")
+            logging.getLogger(__name__).info("Using cached synopsis from last motion_poster response")
+        
+        # Try to get stitched_image_url from last motion_poster response if not provided
+        if not stitched_image_url and _last_motion_poster and "stitched_image" in _last_motion_poster:
+            stitched_image_url = _last_motion_poster["stitched_image"]["url"]
+            logging.getLogger(__name__).info("Using cached stitched_image_url from last motion_poster response")
+        
+        if not synopsis:
+            return jsonify({"error": "synopsis parameter is required or call /api/motion_poster first"}), 400
+        if not stitched_image_url:
+            return jsonify({"error": "stitched_image_url parameter is required or call /api/motion_poster first"}), 400
+
+        try:
+            video_result = generate_video_teaser(
+                title=title,
+                synopsis=synopsis,
+                image_url=stitched_image_url,
+                duration=duration,
+                fal_api_key=app.config["FAL_API_KEY"],
+                model=app.config["FAL_VEO3_MODEL"],
+                timeout=app.config["VIDEO_TIMEOUT_SECONDS"]
+            )
+            
+            # Add image info to response
+            video_result["stitched_image_url"] = stitched_image_url
+            
+            base_url = request.url_root.rstrip("/")
+            if video_result.get("local_file"):
+                video_result["url"] = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(video_result['local_file']).name}"
+            
+            return jsonify(video_result)
+            
+        except Exception as e:
+            logging.getLogger(__name__).error("Video teaser generation failed: %s", e)
+            return jsonify({
+                "error": "Video generation failed", 
+                "details": str(e)
+            }), 500
 
     return app
 
@@ -258,7 +331,7 @@ def _poster_from_local_gpt(*, title: str | None, genre: str | None, synopsis: st
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.7,
+        "temperature": 1,
         "max_tokens": 300,
         "response_format": {"type": "json_object"},
         "stop": ["<|end|>", "<|start|>", "<|channel|>"],
@@ -833,6 +906,234 @@ def _extract_json_object(text: str) -> str | None:
     return None
 
 
+def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int) -> Dict[str, Any]:
+    """Generate a video teaser using FAL.ai's Veo3 image-to-video model"""
+    import time
+    
+    log = logging.getLogger(__name__)
+    
+    if not fal_api_key:
+        raise RuntimeError("FAL_API_KEY not set")
+    
+    # Handle image URL - convert localhost URLs to base64 data URIs
+    final_image_url = image_url
+    if image_url.startswith(('http://localhost', 'http://127.0.0.1')):
+        # For localhost URLs, convert to base64 data URI since FAL.ai can't access localhost
+        try:
+            img_response = requests.get(image_url, timeout=10)
+            img_response.raise_for_status()
+            
+            # Determine MIME type from response headers or URL extension
+            content_type = img_response.headers.get('content-type', 'image/jpeg')
+            if not content_type.startswith('image/'):
+                # Fallback based on URL extension
+                if image_url.lower().endswith('.png'):
+                    content_type = 'image/png'
+                else:
+                    content_type = 'image/jpeg'
+            
+            # Convert to base64 data URI
+            import base64
+            image_data = base64.b64encode(img_response.content).decode('utf-8')
+            final_image_url = f"data:{content_type};base64,{image_data}"
+            logging.getLogger(__name__).info(f"Converted localhost URL to base64 data URI")
+            
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Cannot access local image URL {image_url}: {str(e)}")
+    else:
+        # For external URLs, validate they're accessible
+        if not image_url.startswith(('http://', 'https://')):
+            raise RuntimeError("image_url must be a valid HTTP/HTTPS URL")
+        
+        try:
+            img_response = requests.head(image_url, timeout=10)
+            if img_response.status_code != 200:
+                raise RuntimeError(f"Image URL not accessible: HTTP {img_response.status_code}")
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Cannot access image URL {image_url}: {str(e)}")
+    
+    # Build the prompt for video generation
+    video_prompt = build_video_prompt(title=title, synopsis=synopsis, duration=duration)
+    
+    # Prepare the request payload according to FAL.ai Veo3 API
+    payload = {
+        "prompt": video_prompt,
+        "image_url": final_image_url,
+        "duration": f"{duration}s",  # FAL expects format like "8s"
+        "resolution": "720p",  # FAL default
+        "generate_audio": True
+    }
+    
+    headers = {
+        "Authorization": f"Key {fal_api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Submit the video generation request
+    submit_url = f"https://fal.run/{model}"
+    
+    # Log the request for debugging
+    logging.getLogger(__name__).info(f"FAL.ai request to {submit_url} with payload: {payload}")
+    
+    try:
+        response = requests.post(submit_url, json=payload, headers=headers, timeout=timeout)
+        if response.status_code != 200:
+            # Get detailed error info for debugging
+            try:
+                error_details = response.json()
+                log.error(f"FAL.ai API error details: {error_details}")
+                raise RuntimeError(f"FAL.ai API error ({response.status_code}): {error_details}")
+            except:
+                log.error(f"FAL.ai API error response: {response.text}")
+                raise RuntimeError(f"FAL.ai API error ({response.status_code}): {response.text}")
+        result = response.json()
+        
+        # Check if we have a direct video URL or need to poll for results
+        if "video" in result and "url" in result["video"]:
+            video_url = result["video"]["url"]
+            
+            # Download the video file locally
+            local_file = download_video_file(video_url, "static/generated")
+            
+            return {
+                "video_url": video_url,
+                "local_file": local_file,
+                "duration": duration,
+                "prompt": video_prompt,
+                "model": model,
+                "status": "completed"
+            }
+        elif "request_id" in result:
+            # Poll for completion if async
+            return poll_video_completion(result["request_id"], fal_api_key, model, timeout)
+        else:
+            raise RuntimeError(f"Unexpected response format: {result}")
+            
+    except requests.exceptions.Timeout:
+        raise RuntimeError(f"Video generation timed out after {timeout} seconds")
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(f"FAL.ai API request failed: {str(e)}")
+
+
+def build_video_prompt(*, title: str | None, synopsis: str, duration: int) -> str:
+    """Build an effective prompt for video generation"""
+    prompt_parts = [
+        f"Create a cinematic {duration}-second movie teaser trailer.",
+        "High production value with dramatic lighting and professional cinematography.",
+        "Include dynamic camera movements, engaging visual storytelling.",
+        "No text overlays or credits - pure visual narrative.",
+        "Maintain consistent characters and setting throughout."
+    ]
+    
+    if title:
+        prompt_parts.append(f"Movie title context: {title}")
+    
+    # Add synopsis context
+    prompt_parts.append(f"Story context: {synopsis}")
+    
+    # Add teaser-specific direction
+    prompt_parts.extend([
+        "Focus on establishing mood, key characters, and central conflict.",
+        "Build tension and intrigue without revealing major plot points.",
+        "End with a compelling hook that makes viewers want to see more.",
+        "Professional movie trailer quality with cinematic color grading."
+    ])
+    
+    return " ".join(prompt_parts)
+
+
+def poll_video_completion(request_id: str, fal_api_key: str, model: str, timeout: int) -> Dict[str, Any]:
+    """Poll FAL.ai for video completion status"""
+    import time
+    
+    headers = {
+        "Authorization": f"Key {fal_api_key}",
+    }
+    
+    status_url = f"https://fal.run/{model}/requests/{request_id}"
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        try:
+            response = requests.get(status_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            status = result.get("status", "unknown")
+            
+            if status == "completed":
+                if "video" in result and "url" in result["video"]:
+                    video_url = result["video"]["url"]
+                    local_file = download_video_file(video_url, "static/generated")
+                    
+                    return {
+                        "video_url": video_url,
+                        "local_file": local_file,
+                        "duration": result.get("duration", 8),
+                        "model": model,
+                        "status": "completed",
+                        "request_id": request_id
+                    }
+                else:
+                    raise RuntimeError("Video completed but no URL found in response")
+            
+            elif status in ["failed", "error"]:
+                error_msg = result.get("error", "Unknown error occurred")
+                raise RuntimeError(f"Video generation failed: {error_msg}")
+            
+            elif status in ["queued", "in_progress"]:
+                # Wait before polling again
+                time.sleep(5)
+                continue
+            else:
+                raise RuntimeError(f"Unknown status: {status}")
+                
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"Error polling video status: {str(e)}")
+    
+    raise RuntimeError(f"Video generation timed out after {timeout} seconds")
+
+
+def download_video_file(video_url: str, output_dir: str) -> str:
+    """Download video file from URL and save locally"""
+    from pathlib import Path
+    
+    # Create output directory if it doesn't exist
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Generate unique filename
+    filename = f"teaser_{uuid.uuid4().hex}.mp4"
+    filepath = Path(output_dir) / filename
+    
+    try:
+        response = requests.get(video_url, stream=True, timeout=60)
+        response.raise_for_status()
+        
+        with open(filepath, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        return str(filepath)
+        
+    except Exception as e:
+        raise RuntimeError(f"Failed to download video: {str(e)}")
+
+
 if __name__ == "__main__":  # pragma: no cover
-    app = create_app()
+    parser = argparse.ArgumentParser(description="AI Story Generator with optional video teaser generation")
+    parser.add_argument(
+        "--model", 
+        choices=["veo"], 
+        help="Enable specific models: 'veo' enables FAL.ai Veo3 video teaser generation"
+    )
+    args = parser.parse_args()
+    
+    enable_veo = args.model == "veo"
+    if enable_veo:
+        print("🎬 Video teaser generation enabled with FAL.ai Veo3 model")
+    else:
+        print("📸 Running in image-only mode. Use --model veo to enable video generation")
+    
+    app = create_app(enable_veo=enable_veo)
     app.run(host=os.environ.get("HOST", "0.0.0.0"), port=int(os.environ.get("PORT", "8002")))
