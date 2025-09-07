@@ -16,6 +16,7 @@ from services.motion_poster_service import (
 )
 from services.video_teaser_service import generate_video_teaser
 from services.youtube_upload import upload_video as youtube_upload_video, YouTubeUploadError
+from services.video_postprocess import concat_videos, concat_videos_many, ensure_ffmpeg
 import json
 import secrets
 import requests
@@ -696,6 +697,64 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 tmp_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+    @app.route("/api/concat_videos", methods=["POST", "OPTIONS"])  # stitch uploaded videos (2+)
+    def concat_videos_route():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        files_list = request.files.getlist("files")
+        if not files_list:
+            if "file1" in request.files and "file2" in request.files:
+                files_list = [request.files["file1"], request.files["file2"]]
+            else:
+                return jsonify({"error": "no_files", "details": "Upload videos via form field 'files' (multiple) or provide 'file1' and 'file2'"}), 400
+        run_dir_param = (request.form.get("run_dir") or request.form.get("folder") or "").strip() or "uploads"
+
+        base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+        out_dir = base_out / run_dir_param
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Save temporary parts preserving order
+        temp_parts = []
+        for idx, f in enumerate(files_list):
+            p = out_dir / (f"part{idx+1}_" + uuid.uuid4().hex + ".mp4")
+            f.save(str(p))
+            temp_parts.append(p)
+
+        final_path = out_dir / "stitched.mp4"
+        try:
+            ensure_ffmpeg()
+            if len(temp_parts) == 1:
+                try:
+                    if final_path.exists():
+                        final_path.unlink()
+                    Path(temp_parts[0]).rename(final_path)
+                except Exception:
+                    concat_videos_many([str(temp_parts[0])], final_path)
+            elif len(temp_parts) == 2:
+                concat_videos(str(temp_parts[0]), str(temp_parts[1]), final_path)
+            else:
+                concat_videos_many([str(p) for p in temp_parts], final_path)
+        except Exception as e:
+            return jsonify({"error": "concat_failed", "details": str(e)}), 500
+        finally:
+            for p in temp_parts:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        base_url = request.url_root.rstrip("/")
+        rel = str(final_path.relative_to(app.config["OUTPUT_DIR"])) if final_path.exists() else ""
+        url = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}" if rel else ""
+        return jsonify({
+            "url": url,
+            "local_file": str(final_path),
+            "run_dir": run_dir_param,
+        })
 
     return app
 

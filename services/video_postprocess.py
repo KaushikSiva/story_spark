@@ -253,3 +253,98 @@ def append_poster_and_endcard(*, teaser_path: Path, poster_path: Optional[Path],
                 tmp_end.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def concat_videos(input1: str | Path, input2: str | Path, out_path: Path) -> str:
+    """Concatenate two videos back-to-back and write to out_path.
+
+    Uses MoviePy's concatenate_videoclips with method="compose" to handle
+    differing sizes/codecs robustly.
+    """
+    ensure_ffmpeg()
+    VideoFileClip, _ImageClip, _ColorClip, concatenate_videoclips = _import_moviepy_components()
+    c1 = None
+    c2 = None
+    try:
+        c1 = VideoFileClip(str(input1))
+        c2 = VideoFileClip(str(input2))
+        final = concatenate_videoclips([c1, c2], method="compose")
+        # Write out with compatibility for MoviePy versions
+        tmp_out = out_path.parent / "_tmp_concat.mp4"
+        try:
+            import inspect
+            sig = inspect.signature(final.write_videofile)  # type: ignore[attr-defined]
+            params = sig.parameters
+            if "verbose" in params or "logger" in params:
+                final.write_videofile(
+                    str(tmp_out), codec="libx264", audio_codec="aac", fps=c1.fps or 24, verbose=False, logger=None
+                )
+            else:
+                final.write_videofile(str(tmp_out), codec="libx264", audio_codec="aac", fps=c1.fps or 24)
+        except Exception:
+            final.write_videofile(str(tmp_out), codec="libx264", audio_codec="aac", fps=c1.fps or 24)
+        try:
+            if out_path.exists():
+                out_path.unlink()
+            tmp_out.rename(out_path)
+        finally:
+            try:
+                final.close()
+            except Exception:
+                pass
+        return str(out_path)
+    finally:
+        try:
+            if c1:
+                c1.close()
+        except Exception:
+            pass
+        try:
+            if c2:
+                c2.close()
+        except Exception:
+            pass
+
+
+def concat_videos_many(inputs: list[str | Path], out_path: Path) -> str:
+    """Concatenate N videos in order and write to out_path.
+
+    Uses MoviePy concatenate_videoclips(method="compose") for robustness.
+    """
+    ensure_ffmpeg()
+    VideoFileClip, _ImageClip, _ColorClip, concatenate_videoclips = _import_moviepy_components()
+    clips = []
+    try:
+        for p in inputs:
+            clips.append(VideoFileClip(str(p)))
+        if not clips:
+            raise ValueError("No input videos provided")
+        final = concatenate_videoclips(clips, method="compose")
+        tmp_out = out_path.parent / "_tmp_concat_many.mp4"
+        try:
+            import inspect
+            sig = inspect.signature(final.write_videofile)  # type: ignore[attr-defined]
+            params = sig.parameters
+            fps = getattr(clips[0], 'fps', None) or 24
+            if "verbose" in params or "logger" in params:
+                final.write_videofile(str(tmp_out), codec="libx264", audio_codec="aac", fps=fps, verbose=False, logger=None)
+            else:
+                final.write_videofile(str(tmp_out), codec="libx264", audio_codec="aac", fps=fps)
+        except Exception:
+            final.write_videofile(str(tmp_out), codec="libx264", audio_codec="aac", fps=getattr(clips[0], 'fps', None) or 24)
+        try:
+            if out_path.exists():
+                out_path.unlink()
+            tmp_out.rename(out_path)
+        finally:
+            try:
+                final.close()
+            except Exception:
+                pass
+        return str(out_path)
+    finally:
+        for c in clips:
+            try:
+                c.close()
+            except Exception:
+                pass

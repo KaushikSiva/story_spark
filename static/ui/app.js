@@ -164,6 +164,8 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnUpload) btnUpload.addEventListener("click", handleUploadProcess);
   const btnYtUpload = document.getElementById('btn-yt-upload-file');
   if (btnYtUpload) btnYtUpload.addEventListener('click', handleYouTubeFileUpload);
+  const btnStitch = document.getElementById('btn-stitch');
+  if (btnStitch) btnStitch.addEventListener('click', handleStitchVideos);
   const folderEl = document.getElementById('upload-folder');
   const titleEl = document.querySelector('#gen-form input[name="title"]');
   if (folderEl) folderEl.addEventListener('input', updateUploadPreview);
@@ -426,12 +428,43 @@ function initTabs() {
   const hash = (location.hash || '').replace('#','');
   const saved = (() => { try { return localStorage.getItem('active_tab') || ''; } catch { return ''; } })();
   const map = (v) => (v === 'teaser' ? 'create' : v);
-  const allowed = ['create','post','youtube'];
+  const allowed = ['create','stitch','post','youtube'];
   const initialHash = map(hash);
   const initialSaved = map(saved);
   const initial = allowed.includes(initialHash) ? initialHash : (allowed.includes(initialSaved) ? initialSaved : 'create');
   setActive(initial);
   window.__setActiveTab = setActive;
+}
+
+async function handleStitchVideos() {
+  const status = document.getElementById('stitch-status');
+  const out = document.getElementById('stitch-video-out');
+  const filesEl = document.getElementById('stitch-files');
+  const folder = document.getElementById('stitch-folder');
+  if (!filesEl || !filesEl.files || filesEl.files.length < 2) {
+    if (status) status.textContent = 'Choose at least two video files';
+    return;
+  }
+  const fd = new FormData();
+  for (const f of filesEl.files) {
+    fd.append('files', f);
+  }
+  if (folder && folder.value.trim()) fd.append('run_dir', folder.value.trim());
+  if (status) status.textContent = 'Stitching…';
+  if (out) { out.classList.add('hidden'); out.innerHTML=''; }
+  try {
+    const res = await fetch('/api/concat_videos', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    if (out) {
+      renderVideo(out, data);
+      out.classList.remove('hidden');
+    }
+    if (status) status.textContent = 'Done';
+  } catch (e) {
+    console.error(e);
+    if (status) status.textContent = `Error: ${e.message || e}`;
+  }
 }
 
 function initTheme() {
