@@ -61,6 +61,15 @@ def create_app() -> Flask:
     def health():
         return jsonify({"status": "ok"})
 
+    # Simple UI routes
+    @app.route("/", methods=["GET"])  # serve UI
+    @app.route("/ui", methods=["GET"])  # alias
+    def ui_root():  # pragma: no cover
+        try:
+            return app.send_static_file("ui/index.html")
+        except Exception:
+            return "UI not found. Ensure static/ui/index.html exists.", 404
+
     @app.route("/api/motion_poster", methods=["GET", "OPTIONS"])
     def motion_poster():
         if request.method == "OPTIONS":
