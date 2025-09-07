@@ -439,7 +439,10 @@ function initTheme() {
   const apply = (mode) => {
     document.body.classList.toggle('theme-light', mode === 'light');
     try { localStorage.setItem('theme', mode); } catch {}
-    if (toggle) toggle.textContent = mode === 'light' ? 'Dark Mode' : 'Light Mode';
+    if (toggle) {
+      toggle.setAttribute('title', mode === 'light' ? 'Switch to Dark' : 'Switch to Light');
+      setThemeIcon(mode);
+    }
   };
   let mode = (() => { try { return localStorage.getItem('theme'); } catch { return null; } })();
   if (!mode) {
@@ -452,9 +455,29 @@ function initTheme() {
   });
 }
 
+function setThemeIcon(mode) {
+  const btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  if (mode === 'light') {
+    // show sun icon (light active)
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="5"/>
+        <path d="M12 2v2M12 20v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M2 12h2M20 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+      </svg>`;
+  } else {
+    // show moon icon (dark active)
+    btn.innerHTML = `
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>`;
+  }
+}
+
 function initBrand() {
   const applyAccent = (hex) => {
     document.documentElement.style.setProperty('--accent', hex);
+    if (document.body) document.body.style.setProperty('--accent', hex);
     try { localStorage.setItem('accent', hex); } catch {}
   };
   const saved = (() => { try { return localStorage.getItem('accent'); } catch { return null; } })();
