@@ -179,17 +179,18 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                     payload["stitched_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rels}", "filename": rels}
                     log.info("stitched collage saved to %s", rels)
 
-                # poster (use people refs + a single story frame for identity; avoid stitched collage)
-                extra_refs = []
+                # poster: use people references + a few scene frames for identity; prompt forbids collage layout
+                scene_refs = []
                 try:
-                    # Just one representative frame to nudge identity, not layout
-                    if files:
-                        p = file_to_genai_part(files[0])
-                        if p is not None:
-                            extra_refs.append(p)
+                    pick_idxs = [0, 2, 4]
+                    for idx in pick_idxs:
+                        if idx < len(files):
+                            p = file_to_genai_part(files[idx])
+                            if p is not None:
+                                scene_refs.append(p)
                 except Exception:
                     pass
-                strong_refs = (list(ref_parts) if ref_parts else []) + extra_refs
+                strong_refs = (list(ref_parts) if ref_parts else []) + scene_refs
                 poster_file = generate_poster_from_synopsis(
                     title=(payload.get("title") or "Untitled"),
                     synopsis=payload["synopsis"],

@@ -11,6 +11,7 @@ from image_utils import (
     extract_images_from_genai_response,
     save_images_parts_with_pattern,
     save_image_part_fixed,
+    file_to_genai_part,
 )
 
 
@@ -337,23 +338,57 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
         else:
             raise
 
-    parts = extract_images_from_genai_response(response)
+    # Generate strictly one image per synopsis line to avoid montage artifacts in first scene
     saved = []
     next_idx = 1
-    if parts:
-        batch = save_images_parts_with_pattern(parts[:n], out_dir, pattern="scene_{i}.{ext}", start_index=next_idx)
-        saved.extend(batch)
-        next_idx += len(batch)
-    # If fewer than requested, fall back per-line to reach n
-    if len(saved) < n:
-        # Per-line retry to salvage at least one
-        lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
-        for ln in lines:
+    lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
+    # Identity guidance to improve character consistency across beats
+    cast_hint = (
+        f"Use the same ~{character_target if character_target else 2} principal characters consistently in every image; "
+        "keep faces, hairstyles, and wardrobe colors coherent across beats. "
+        "Map any reference faces to recurring roles and reuse them. "
+    )
+    for ln in lines[:n]:
+        single_prompt = (
+            "Create one cinematic image illustrating the following story beat. "
+            "Do not include any words or text on the image. Maintain consistent characters and setting. "
+            "No collage, no split screen, no grid, no montage tiles, no multi‑panel.\n"
+            f"Beat: {ln}\n"
+            f"Identity: {cast_hint}"
+        )
+        contents_seed: list = []
+        if reference_parts:
+            contents_seed.extend(list(reference_parts))
+        # Add a rolling window of previously generated scene frames to reinforce identity (last 2)
+        try:
+            last_two_paths = [p for p in saved[-2:]]  # saved holds file paths
+            for pth in last_two_paths:
+                part_prev = file_to_genai_part(pth)
+                if part_prev is not None:
+                    contents_seed.append(part_prev)
+        except Exception:
+            pass
+        contents2 = (contents_seed + [single_prompt]) if contents_seed else single_prompt
+        try:
+            r = _call(model_name, contents2)
+        except Exception:
+            fb = os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview")
+            r = _call(fb, contents2)
+        more = extract_images_from_genai_response(r)
+        if more:
+            batch = save_images_parts_with_pattern(more[:1], out_dir, pattern="scene_{i}.{ext}", start_index=next_idx)
+            saved.extend(batch)
+            next_idx += len(batch)
+    # If still short of the requested count, try a second pass with an alternate-take hint
+    attempts = 0
+    while len(saved) < n and attempts < 2:
+        for ln in lines[:n]:
             if len(saved) >= n:
                 break
             single_prompt = (
-                "Create one cinematic image illustrating the following story beat. "
-                "Do not include any words or text on the image. Maintain consistent characters and setting.\n"
+                "Create one cinematic image (alternate take) for this story beat. "
+                "Do not include any words or text on the image. Maintain consistent characters and setting. "
+                "No collage, no split screen, no grid, no montage tiles, no multi‑panel.\n"
                 f"Beat: {ln}"
             )
             contents2 = (list(reference_parts) + [single_prompt]) if reference_parts else single_prompt
@@ -367,6 +402,8 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
                 batch = save_images_parts_with_pattern(more[:1], out_dir, pattern="scene_{i}.{ext}", start_index=next_idx)
                 saved.extend(batch)
                 next_idx += len(batch)
+        attempts += 1
+
     if not saved:
         raise RuntimeError("No images returned for synopsis prompt")
     return saved[:n]

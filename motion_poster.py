@@ -13,7 +13,9 @@ def build_images_prompt_from_synopsis(synopsis: str, n: int, *, character_target
     default = (
         "Create a beautifully entertaining {n} part story with {n} images inspired by the following movie synopsis. "
         "Tell the story purely through imagery with no words or text on the images. "
-        "Keep characters, setting, and styling consistent across all {n} images. {ref_note}\n\n"
+        "Keep characters, setting, and styling consistent across all {n} images. {ref_note} "
+        "Use the same principal characters across all parts; keep faces, hairstyles, and wardrobe colors coherent. "
+        "Each image must depict a single, unified scene: no collage, no split screen, no grid, no montage tiles, no multi‑panel, no inset frames.\n\n"
         "Synopsis:\n{synopsis}\n\n"
         "Output: {n} distinct images, one for each part."
     )
