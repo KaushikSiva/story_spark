@@ -342,11 +342,15 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     saved = []
     next_idx = 1
     lines = [ln.strip() for ln in _enforce_synopsis_lines(synopsis, genre=None).splitlines() if ln.strip()]
-    # Identity guidance to improve character consistency across beats
+    # Identity + diversity guidance: keep characters consistent but vary the scene strongly
     cast_hint = (
         f"Use the same ~{character_target if character_target else 2} principal characters consistently in every image; "
-        "keep faces, hairstyles, and wardrobe colors coherent across beats. "
+        "keep faces, hairstyles, and signature wardrobe items coherent across beats. "
         "Map any reference faces to recurring roles and reuse them. "
+    )
+    diversity_hint = (
+        "Background and environment must change significantly from other images: vary location, time of day, lighting, color palette, weather, and camera angle; "
+        "avoid reusing the same backdrop or composition."
     )
     for ln in lines[:n]:
         single_prompt = (
@@ -354,21 +358,10 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
             "Do not include any words or text on the image. Maintain consistent characters and setting. "
             "No collage, no split screen, no grid, no montage tiles, no multi‑panel.\n"
             f"Beat: {ln}\n"
-            f"Identity: {cast_hint}"
+            f"Identity: {cast_hint}\n"
+            f"Variation: {diversity_hint}"
         )
-        contents_seed: list = []
-        if reference_parts:
-            contents_seed.extend(list(reference_parts))
-        # Add a rolling window of previously generated scene frames to reinforce identity (last 2)
-        try:
-            last_two_paths = [p for p in saved[-2:]]  # saved holds file paths
-            for pth in last_two_paths:
-                part_prev = file_to_genai_part(pth)
-                if part_prev is not None:
-                    contents_seed.append(part_prev)
-        except Exception:
-            pass
-        contents2 = (contents_seed + [single_prompt]) if contents_seed else single_prompt
+        contents2 = (list(reference_parts) + [single_prompt]) if reference_parts else single_prompt
         try:
             r = _call(model_name, contents2)
         except Exception:
