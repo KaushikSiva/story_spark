@@ -278,3 +278,8 @@ def _append_poster_and_tag(video_path: str, output_dir: str) -> str:
         except Exception:
             pass
     return str(final_path)
+
+
+def append_poster_and_tag(video_path: str, output_dir: str) -> str:
+    """Public wrapper for app routes to post-process an arbitrary video file."""
+    return _append_poster_and_tag(video_path, output_dir)

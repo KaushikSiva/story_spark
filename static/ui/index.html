@@ -102,6 +102,22 @@
         </div>
         <div id="video-out" class="video-out hidden"></div>
       </section>
+
+      <section id="upload-tools" class="card">
+        <h3>Post‑process Existing Video</h3>
+        <p class="hint">Upload a local video to append the first look and a “Coming soon” end card. It uses the latest title folder (or the Title field above if provided).</p>
+        <div class="grid">
+          <label>
+            <span>Upload video</span>
+            <input type="file" id="upload-video" accept="video/*" />
+          </label>
+        </div>
+        <div class="actions">
+          <button id="btn-upload-process" class="secondary">Process Uploaded Video</button>
+          <span id="upload-status" aria-live="polite"></span>
+        </div>
+        <div id="upload-video-out" class="video-out hidden"></div>
+      </section>
     </main>
 
     <footer>

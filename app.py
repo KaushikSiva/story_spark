@@ -16,6 +16,7 @@ from services.motion_poster_service import (
     get_first_look_path,
 )
 from services.video_teaser_service import generate_video_teaser
+from services.video_teaser_service import append_poster_and_tag
 
 
 load_dotenv()
@@ -327,6 +328,55 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         except Exception as e:
             logging.getLogger(__name__).error("resync_with_poster failed: %s", e)
             return jsonify({"error": "resync_failed", "details": str(e)}), 500
+
+    @app.route("/api/postprocess_video", methods=["POST", "OPTIONS"])
+    def postprocess_video():
+        if request.method == "OPTIONS":
+            return ("", 204)
+        if "file" not in request.files:
+            return jsonify({"error": "no_file", "details": "Upload a video via form field 'file'"}), 400
+
+        f = request.files["file"]
+        title_override = (request.form.get("title") or "").strip() or None
+
+        # Determine output dir in title folder if available
+        last_payload = getattr(app, "_last_motion_poster_cache", None)
+        base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+        run_dir = None
+        if title_override:
+            slug = re.sub(r"[^a-z0-9]+", "-", title_override.lower()).strip("-") or "untitled"
+            run_dir = slug
+        elif last_payload and last_payload.get("run_dir"):
+            run_dir = last_payload.get("run_dir")
+        else:
+            run_dir = "uploads"
+
+        out_dir = base_out / run_dir
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        # Save uploaded as upload.mp4 (overwrite)
+        upload_path = out_dir / "upload.mp4"
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        f.save(str(upload_path))
+
+        try:
+            final_path = append_poster_and_tag(str(upload_path), str(out_dir))
+        except Exception as e:
+            return jsonify({"error": "postprocess_failed", "details": str(e)}), 500
+
+        base_url = request.url_root.rstrip("/")
+        rel = str(Path(final_path).relative_to(app.config["OUTPUT_DIR"]))
+        return jsonify({
+            "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}",
+            "local_file": final_path,
+            "run_dir": run_dir,
+        })
 
     return app
 
