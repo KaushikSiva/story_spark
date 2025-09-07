@@ -153,6 +153,8 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnResync) btnResync.addEventListener("click", handleResyncWithPoster);
   const btnClear = document.getElementById("btn-clear");
   if (btnClear) btnClear.addEventListener("click", handleClear);
+  const btnUpload = document.getElementById("btn-upload-process");
+  if (btnUpload) btnUpload.addEventListener("click", handleUploadProcess);
   // Restore last result on refresh
   try {
     const raw = localStorage.getItem('last_result');
@@ -236,6 +238,37 @@ function renderVideo(container, data) {
       ${model ? `<span class="pill alt">${escapeHtml(model)}</span>` : ""}
     </div>
   `;
+}
+
+async function handleUploadProcess() {
+  const fileInput = document.getElementById('upload-video');
+  const status = document.getElementById('upload-status');
+  const out = document.getElementById('upload-video-out');
+  const formEl = document.querySelector('#gen-form');
+  if (!fileInput || !fileInput.files || !fileInput.files[0]) {
+    status.textContent = 'Choose a video file first';
+    return;
+  }
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  // Pass title if present so backend uses that folder
+  if (formEl && formEl.title && formEl.title.value.trim()) {
+    fd.append('title', formEl.title.value.trim());
+  }
+  status.textContent = 'Processing…';
+  out.classList.add('hidden');
+  out.innerHTML = '';
+  try {
+    const res = await fetch('/api/postprocess_video', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
+    renderVideo(out, data);
+    out.classList.remove('hidden');
+    status.textContent = 'Done';
+  } catch (e) {
+    console.error(e);
+    status.textContent = `Error: ${e.message || e}`;
+  }
 }
 
 function handleClear() {
