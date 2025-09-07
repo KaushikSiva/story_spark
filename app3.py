@@ -90,8 +90,6 @@ def create_app() -> Flask:
             "genre": result.get("genre", ""),
             "source": source,
         }
-        if llm_error:
-            payload["llm_error"] = llm_error
         return jsonify(payload)
 
     return app
@@ -277,12 +275,48 @@ def _normalize_poster_fields(obj: Dict[str, Any]) -> Dict[str, Any]:
         numc_int = _infer_num_characters(synopsis)
     numc_int = max(0, min(10, numc_int))
 
+    final_synopsis = _enforce_synopsis_lines((synopsis or "").strip(), genre=str(genre))
+
     return {
         "title": title.strip() or "Untitled",
-        "synopsis": synopsis.strip() or "First look reveal",
+        "synopsis": final_synopsis,
         "num_characters": numc_int,
         "genre": genre.strip() or "Drama",
     }
+
+
+def _enforce_synopsis_lines(text: str, *, genre: str | None) -> str:
+    import re
+    if not text:
+        text = "A mysterious event sets quiet lives in motion."
+    # Normalize line breaks; split to lines if present, else by sentences
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        # Split by sentence enders
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        lines = [p.strip() for p in parts if p.strip()]
+    # Truncate to at most 8 lines
+    lines = lines[:8]
+    # Pad to at least 7 lines with genre-aware beats
+    g = (genre or "Drama").lower()
+    fillers = [
+        "A reluctant protagonist steps forward, facing an unexpected choice.",
+        "Allies emerge, but trust comes with a cost.",
+        "A discovery upends what they believe is true.",
+        f"Stakes rise as forces of {g} close in.",
+        "Bonds are tested; a hidden weakness surfaces.",
+        "A risky plan forms, promising hope and danger.",
+        "Their world will not be the same again.",
+    ]
+    i = 0
+    while len(lines) < 7 and i < len(fillers):
+        lines.append(fillers[i])
+        i += 1
+    # Ensure 7–8 lines; if exactly 7, add a closing tone line
+    if len(lines) == 7:
+        lines.append("The path forward is clear—and costly.")
+    # Join back
+    return "\n".join(lines[:8])
 
 
 def _infer_num_characters(script: str) -> int:
