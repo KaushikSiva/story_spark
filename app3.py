@@ -92,18 +92,21 @@ def create_app() -> Flask:
             completions_path=app.config["LLM_COMPLETIONS_PATH"],
         )
 
+        # Use the finalized title for logging (request param may be None)
+        final_title_for_log = (result.get("title") or title or "Untitled")
         log.info(
             "motion_poster source=%s title=%s genre=%s synopsis=%s",
             source,
-            title,
+            final_title_for_log,
             result.get("genre"),
             result.get("synopsis"),
         )
         if llm_error:
             log.warning("motion_poster llm_error=%s", llm_error)
 
+        final_title = (result.get("title") or title or "Untitled")
         payload = {
-            "title": result.get("title", title or "Untitled"),
+            "title": final_title,
             "synopsis": result.get("synopsis", ""),
             "num_characters": int(result.get("num_characters", 1) or 1),
             "genre": result.get("genre", ""),
@@ -140,6 +143,20 @@ def create_app() -> Flask:
                     payload["stitched_image"] = {
                         "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(stitched).name}",
                         "filename": Path(stitched).name,
+                    }
+                # Create a single first-look poster as well
+                safe_title = (payload.get("title") or title or "Untitled").strip() or "Untitled"
+                poster_file = generate_poster_from_synopsis(
+                    title=safe_title,
+                    synopsis=payload["synopsis"],
+                    director="Bruno",
+                    model_name=app.config["IMAGE_STORY_MODEL"],
+                    out_dir=app.config["OUTPUT_DIR"],
+                )
+                if poster_file:
+                    payload["poster_image"] = {
+                        "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(poster_file).name}",
+                        "filename": Path(poster_file).name,
                     }
             except Exception as e:  # pragma: no cover
                 # Do not fail the whole request; just omit images
@@ -498,6 +515,49 @@ def generate_images_from_synopsis(*, synopsis: str, model_name: str, out_dir: st
     if not saved:
         raise RuntimeError("No images returned for synopsis prompt")
     return saved[:n]
+
+
+def build_poster_prompt(title: str, synopsis: str, director: str = "Bruno") -> str:
+    return (
+        f"Design a cinematic FIRST LOOK MOVIE POSTER for the film titled '{title}'. "
+        f"Director credit: Directed by {director}. "
+        f"Use the following synopsis to guide the imagery, characters, tone, and setting. "
+        f"Include tasteful, legible on-poster text: the film title '{title}', the credit 'Directed by {director}', and 2–4 thematically appropriate character names you invent (avoid real IP). "
+        f"Style: high fidelity, cohesive layout, strong typography, filmic color grading, premium key-art quality. "
+        f"Avoid watermarks or logos.\n\n"
+        f"Synopsis:\n{synopsis.strip()}"
+    )
+
+
+def generate_poster_from_synopsis(*, title: str, synopsis: str, director: str, model_name: str, out_dir: str) -> str | None:
+    if not _GENAI_AVAILABLE:
+        return None
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+
+    client = genai.Client(api_key=api_key)
+    cfg = genai_types.GenerateContentConfig(response_modalities=["Text", "Image"]) if genai_types else None
+
+    prompt = build_poster_prompt(title, _enforce_synopsis_lines(synopsis, genre=None), director)
+
+    def _call(model: str):
+        return client.models.generate_content(model=model, contents=prompt, config=cfg)
+
+    try:
+        response = _call(model_name)
+    except Exception:
+        fb = os.environ.get("FALLBACK_IMAGE_MODEL", "models/gemini-2.5-flash-image-preview")
+        try:
+            response = _call(fb)
+        except Exception:
+            return None
+
+    parts = _extract_images_from_genai_response(response)
+    if not parts:
+        return None
+    saved = _save_images_parts(parts[:1], out_dir)
+    return saved[0] if saved else None
 
 
 def _extract_images_from_genai_response(response):
