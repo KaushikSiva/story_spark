@@ -166,6 +166,17 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnYtUpload) btnYtUpload.addEventListener('click', handleYouTubeFileUpload);
   const btnStitch = document.getElementById('btn-stitch');
   if (btnStitch) btnStitch.addEventListener('click', handleStitchVideos);
+  // Stitch drop/browse handlers
+  const addBtn = document.getElementById('stitch-add');
+  const inputEl = document.getElementById('stitch-files');
+  const drop = document.getElementById('stitch-drop');
+  if (addBtn && inputEl) addBtn.addEventListener('click', () => inputEl.click());
+  if (inputEl) inputEl.addEventListener('change', () => { if (inputEl.files) { addStitchFiles(inputEl.files); inputEl.value = ''; }});
+  if (drop) {
+    ['dragenter','dragover'].forEach(evt => drop.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.add('dragover'); }));
+    ['dragleave','drop'].forEach(evt => drop.addEventListener(evt, (e) => { e.preventDefault(); e.stopPropagation(); drop.classList.remove('dragover'); }));
+    drop.addEventListener('drop', (e) => { const dt = e.dataTransfer; if (dt && dt.files) addStitchFiles(dt.files); });
+  }
   const folderEl = document.getElementById('upload-folder');
   const titleEl = document.querySelector('#gen-form input[name="title"]');
   if (folderEl) folderEl.addEventListener('input', updateUploadPreview);
@@ -441,12 +452,13 @@ async function handleStitchVideos() {
   const out = document.getElementById('stitch-video-out');
   const filesEl = document.getElementById('stitch-files');
   const folder = document.getElementById('stitch-folder');
-  if (!filesEl || !filesEl.files || filesEl.files.length < 2) {
+  const files = (window.__STITCH_QUEUE__ && window.__STITCH_QUEUE__.slice()) || (filesEl && filesEl.files ? Array.from(filesEl.files) : []);
+  if (!files || files.length < 2) {
     if (status) status.textContent = 'Choose at least two video files';
     return;
   }
   const fd = new FormData();
-  for (const f of filesEl.files) {
+  for (const f of files) {
     fd.append('files', f);
   }
   if (folder && folder.value.trim()) fd.append('run_dir', folder.value.trim());
@@ -465,6 +477,88 @@ async function handleStitchVideos() {
     console.error(e);
     if (status) status.textContent = `Error: ${e.message || e}`;
   }
+}
+
+// Accumulate selected/dropped files for stitching
+function addStitchFiles(fileList) {
+  if (!fileList || !fileList.length) return;
+  const arr = Array.from(fileList).filter(f => f && f.type && f.type.startsWith('video/'));
+  if (!arr.length) return;
+  if (!window.__STITCH_QUEUE__) window.__STITCH_QUEUE__ = [];
+  window.__STITCH_QUEUE__.push(...arr);
+  renderStitchQueue();
+}
+
+function renderStitchQueue() {
+  const ul = document.getElementById('stitch-list');
+  if (!ul) return;
+  const q = (window.__STITCH_QUEUE__ || []).slice(0, 50); // safety cap
+  ul.innerHTML = q.map((f, i) => `
+    <li draggable="true" data-index="${i}">
+      <div class="file-row">
+        <span class="badge">${i+1}</span>
+        <span class="file-name">${escapeHtml(f.name || ('video'+(i+1)))}</span>
+      </div>
+      <div class="row-actions">
+        <button class="btn-up" title="Move up" aria-label="Move up">▲</button>
+        <button class="btn-down" title="Move down" aria-label="Move down">▼</button>
+        <button class="btn-remove" title="Remove" aria-label="Remove">✕</button>
+      </div>
+    </li>`).join('');
+
+  // Attach DnD handlers
+  let dragSrcIdx = null;
+  ul.querySelectorAll('li').forEach(li => {
+    li.addEventListener('dragstart', (e) => {
+      dragSrcIdx = Number(li.getAttribute('data-index'));
+      li.classList.add('dragging');
+      try { e.dataTransfer.effectAllowed = 'move'; } catch {}
+    });
+    li.addEventListener('dragend', () => {
+      li.classList.remove('dragging');
+      dragSrcIdx = null;
+    });
+    li.addEventListener('dragover', (e) => { e.preventDefault(); });
+    li.addEventListener('drop', (e) => {
+      e.preventDefault();
+      const targetIdx = Number(li.getAttribute('data-index'));
+      if (dragSrcIdx === null || isNaN(targetIdx)) return;
+      reorderStitchQueue(dragSrcIdx, targetIdx);
+    });
+  });
+
+  // Button actions via delegation
+  ul.onclick = (ev) => {
+    const btn = ev.target.closest('button');
+    if (!btn) return;
+    const li = btn.closest('li');
+    if (!li) return;
+    const idx = Number(li.getAttribute('data-index'));
+    if (btn.classList.contains('btn-up')) {
+      reorderStitchQueue(idx, Math.max(0, idx - 1));
+    } else if (btn.classList.contains('btn-down')) {
+      reorderStitchQueue(idx, Math.min((window.__STITCH_QUEUE__ || []).length - 1, idx + 1));
+    } else if (btn.classList.contains('btn-remove')) {
+      removeStitchItem(idx);
+    }
+  };
+}
+
+function reorderStitchQueue(from, to) {
+  const q = window.__STITCH_QUEUE__ || [];
+  if (from === to || from < 0 || to < 0 || from >= q.length || to >= q.length) return;
+  const item = q.splice(from, 1)[0];
+  q.splice(to, 0, item);
+  window.__STITCH_QUEUE__ = q;
+  renderStitchQueue();
+}
+
+function removeStitchItem(idx) {
+  const q = window.__STITCH_QUEUE__ || [];
+  if (idx < 0 || idx >= q.length) return;
+  q.splice(idx, 1);
+  window.__STITCH_QUEUE__ = q;
+  renderStitchQueue();
 }
 
 function initTheme() {

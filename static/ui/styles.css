@@ -35,6 +35,22 @@ header .tag{margin:0;color:var(--muted)}
 .tab-panel.active{display:block}
 .sidebar-actions{margin-top:16px}
 .small-btn{padding:8px 10px;font-weight:600}
+.link-btn{background:transparent;color:var(--accent);border:0;padding:0 4px;border-radius:6px;cursor:pointer}
+.link-btn:hover{text-decoration:underline}
+.hidden-input{position:absolute;left:-9999px;width:1px;height:1px;opacity:0}
+.dropzone{border:1px dashed var(--border);border-radius:12px;padding:14px;margin-top:6px;background:rgba(255,255,255,0.02)}
+.dropzone.dragover{border-color:color-mix(in oklab, var(--accent) 60%, var(--border));background:color-mix(in oklab, var(--accent) 10%, transparent)}
+.dz-inner{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.dz-text{color:var(--muted)}
+.file-list{list-style:none;margin:10px 0 0;padding:0;max-height:160px;overflow:auto}
+.file-list li{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 8px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;background:rgba(0,0,0,.04)}
+.file-list .badge{font-size:11px;background:var(--pill);color:var(--text);border-radius:999px;padding:2px 8px}
+.file-row{display:flex;align-items:center;gap:8px;min-width:0}
+.file-name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px}
+.row-actions{display:flex;align-items:center;gap:6px}
+.row-actions button{background:transparent;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:4px 6px;cursor:pointer}
+.row-actions button:hover{border-color:color-mix(in oklab, var(--accent) 60%, var(--border));background:color-mix(in oklab, var(--accent) 12%, transparent)}
+.file-list li.dragging{opacity:.6}
 .accent-row{margin-top:18px;padding-top:12px;border-top:1px solid var(--border)}
 .swatches{display:flex;gap:8px;margin-top:6px}
 .swatch{width:22px;height:22px;border-radius:50%;border:1px solid var(--border);background:var(--accent);cursor:pointer;padding:0}

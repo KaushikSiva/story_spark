@@ -192,10 +192,17 @@
         <h3>Stitch Two Videos</h3>
         <p class="hint">Pick two local videos to concatenate back‑to‑back into one clip.</p>
         <div class="grid">
-          <label>
-            <span>Videos (select 2+)</span>
-            <input type="file" id="stitch-files" accept="video/*" multiple />
-          </label>
+          <div>
+            <span class="hint">Videos (select 2+)</span>
+            <div id="stitch-drop" class="dropzone">
+              <div class="dz-inner">
+                <div class="dz-text">Drop files here or</div>
+                <button type="button" id="stitch-add" class="link-btn">browse</button>
+              </div>
+              <input type="file" id="stitch-files" accept="video/*" multiple class="hidden-input" />
+            </div>
+            <ul id="stitch-list" class="file-list"></ul>
+          </div>
           <label>
             <span>Folder (optional)</span>
             <input type="text" id="stitch-folder" placeholder="e.g., trailers" />
