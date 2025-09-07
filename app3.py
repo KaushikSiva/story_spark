@@ -264,10 +264,13 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             return jsonify(video_result)
             
         except Exception as e:
-            logging.getLogger(__name__).error("Video teaser generation failed: %s", e)
+            import traceback
+            full_traceback = traceback.format_exc()
+            logging.getLogger(__name__).error("Video teaser generation failed: %s\nFull traceback: %s", e, full_traceback)
             return jsonify({
                 "error": "Video generation failed", 
-                "details": str(e)
+                "details": str(e),
+                "traceback": full_traceback
             }), 500
 
     return app
