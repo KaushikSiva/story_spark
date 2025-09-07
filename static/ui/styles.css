@@ -20,7 +20,7 @@ header,footer{max-width:1100px;margin:20px auto;padding:0 16px}
 .icon-btn:hover{border-color:color-mix(in oklab, var(--accent) 60%, var(--border));background:color-mix(in oklab, var(--accent) 14%, transparent)}
 .logo{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;background:var(--accent);color:#06101e}
 header h1{margin:0;font-size:22px}
-header .tag{margin:0;color:var(--muted)}
+header .tag{margin:0;color:var(--muted);text-align:center}
 /* layout + sidebar tabs */
 .layout{display:flex;max-width:1200px;margin:0 auto;padding:0 16px 40px;gap:24px}
 .sidebar{width:240px;padding:12px 8px 24px;position:sticky;top:0;align-self:flex-start}
