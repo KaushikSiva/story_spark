@@ -14,7 +14,9 @@ header,footer{max-width:1100px;margin:20px auto;padding:0 16px}
 .headwrap{display:flex;flex-direction:column;gap:6px}
 .brandline{display:flex;align-items:center;justify-content:space-between;gap:10px}
 .header-actions{display:flex;align-items:center;gap:8px}
-.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;background:transparent;border:1px solid var(--border);border-radius:999px;color:var(--text);cursor:pointer;transition:all .2s ease}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:52px;height:52px;background:transparent;border:1px solid var(--border);border-radius:999px;color:var(--text);cursor:pointer;transition:all .2s ease}
+.icon-btn svg{display:block;width:36px;height:36px}
+.icon-btn:focus{outline:none;box-shadow:0 0 0 3px color-mix(in oklab, var(--accent) 25%, transparent)}
 .icon-btn:hover{border-color:color-mix(in oklab, var(--accent) 60%, var(--border));background:color-mix(in oklab, var(--accent) 14%, transparent)}
 .logo{display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;background:var(--accent);color:#06101e}
 header h1{margin:0;font-size:22px}
