@@ -242,6 +242,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             return jsonify({"error": "stitched_image_url parameter is required or call /api/motion_poster first"}), 400
 
         try:
+            logging.getLogger(__name__).info("Starting video teaser generation...")
             video_result = generate_video_teaser(
                 title=title,
                 synopsis=synopsis,
@@ -251,6 +252,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 model=app.config["FAL_VEO3_MODEL"],
                 timeout=app.config["VIDEO_TIMEOUT_SECONDS"]
             )
+            logging.getLogger(__name__).info("Video teaser generation completed")
             
             # Add image info to response
             video_result["stitched_image_url"] = stitched_image_url
