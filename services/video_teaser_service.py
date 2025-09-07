@@ -8,13 +8,25 @@ import requests
 from video_teaser import build_video_prompt_base, build_video_prompt_safe_suffix
 
 
-def build_video_prompt(*, title: str | None, synopsis: str, duration: int, safe: bool = False) -> str:
+def build_video_prompt(*, title: str | None, synopsis: str, duration: int, safe: bool = False, style: str | None = None) -> str:
     base = build_video_prompt_base(duration)
     parts = [base]
     if title:
         parts.append(f"Movie title context: {title}")
     # sanitize synopsis
     parts.append(f"Story context: {sanitize_synopsis(synopsis)}")
+    # Optional reference-style structure inspired by typical cinematic teasers
+    if (style or "").lower() in {"ref", "reference", "cinematic", "hollywood"}:
+        parts.append(
+            "Structure beats (8s total): "
+            "0.0–0.8s cold open with a striking visual and a percussive hit; "
+            "0.8–2.5s three quick shots that establish WHO/WHERE (match cuts, sound pulses); "
+            "2.5–5.5s rising stakes with two medium shots and one wide, tension ramps; "
+            "5.5–7.2s micro‑montage of 5–6 ultra‑fast cuts synced to stingers; "
+            "7.2–8.0s title/emblem reveal with a hard audio button. "
+            "Shot grammar: alternate wide/medium/close for rhythm; use whip pans and push‑ins tastefully. "
+            "Audio: motif + pulses + risers + stingers; purposeful near‑silence before impacts."
+        )
     if safe:
         parts.append(build_video_prompt_safe_suffix())
     return " ".join(p for p in parts if p)
@@ -40,7 +52,7 @@ def sanitize_synopsis(text: str) -> str:
     return sanitized
 
 
-def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int, output_dir: str = "static/generated") -> Dict[str, Any]:
+def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, duration: int, fal_api_key: str, model: str, timeout: int, output_dir: str = "static/generated", style: str | None = None) -> Dict[str, Any]:
     log = logging.getLogger(__name__)
     if not fal_api_key:
         raise RuntimeError("FAL_API_KEY not set")
@@ -87,7 +99,7 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
         }
 
     safe = False
-    prompt = build_video_prompt(title=title, synopsis=synopsis, duration=duration_effective, safe=safe)
+    prompt = build_video_prompt(title=title, synopsis=synopsis, duration=duration_effective, safe=safe, style=style)
     payload = make_payload(prompt)
 
     headers = {"Authorization": f"Key {fal_api_key}", "Content-Type": "application/json"}
@@ -106,7 +118,7 @@ def generate_video_teaser(*, title: str | None, synopsis: str, image_url: str, d
             if response.status_code == 422 and err_type == "content_policy_violation":
                 log.info("Retrying video generation with policy‑safe prompt…")
                 safe = True
-                payload2 = make_payload(build_video_prompt(title=title, synopsis=synopsis, duration=duration_effective, safe=True))
+                payload2 = make_payload(build_video_prompt(title=title, synopsis=synopsis, duration=duration_effective, safe=True, style=style))
                 response2 = requests.post(submit_url, json=payload2, headers=headers, timeout=timeout)
                 if response2.status_code != 200:
                     try:

@@ -179,18 +179,8 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                     payload["stitched_image"] = {"url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rels}", "filename": rels}
                     log.info("stitched collage saved to %s", rels)
 
-                # poster: use people references + a few scene frames for identity; prompt forbids collage layout
-                scene_refs = []
-                try:
-                    pick_idxs = [0, 2, 4]
-                    for idx in pick_idxs:
-                        if idx < len(files):
-                            p = file_to_genai_part(files[idx])
-                            if p is not None:
-                                scene_refs.append(p)
-                except Exception:
-                    pass
-                strong_refs = (list(ref_parts) if ref_parts else []) + scene_refs
+                # poster: use only PEOPLE_DIR references (avoid biasing toward any single scene backdrop)
+                strong_refs = list(ref_parts) if ref_parts else []
                 poster_file = generate_poster_from_synopsis(
                     title=(payload.get("title") or "Untitled"),
                     synopsis=payload["synopsis"],
@@ -241,6 +231,11 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             return jsonify({"error": "stitched_image_url parameter is required or call /api/motion_poster first"}), 400
 
         try:
+            # Determine output dir based on cached run_dir (title folder); fallback to base
+            base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+            out_dir = str(base_out / (last_payload.get("run_dir") or "")) if last_payload else str(base_out)
+            if not out_dir.strip():
+                out_dir = str(base_out)
             video_result = generate_video_teaser(
                 title=title,
                 synopsis=synopsis,
@@ -249,11 +244,14 @@ def create_app(*, enable_veo: bool = False) -> Flask:
                 fal_api_key=app.config["FAL_API_KEY"],
                 model=app.config["FAL_VEO3_MODEL"],
                 timeout=app.config["VIDEO_TIMEOUT_SECONDS"],
+                output_dir=out_dir,
+                style=(request.args.get("style") or request.args.get("reference") or None),
             )
             # attach convenience URL
             base_url = request.url_root.rstrip("/")
             if video_result.get("local_file"):
-                video_result["url"] = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{Path(video_result['local_file']).name}"
+                rel = str(Path(video_result["local_file"]).relative_to(app.config["OUTPUT_DIR"]))
+                video_result["url"] = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}"
             video_result["stitched_image_url"] = stitched_image_url
             return jsonify(video_result)
         except Exception as e:

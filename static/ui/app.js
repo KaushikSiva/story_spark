@@ -145,6 +145,7 @@ async function handleGenerateVideo() {
   const status = document.getElementById("video-status");
   const out = document.getElementById("video-out");
   const durSel = document.getElementById("teaser-duration");
+  const refStyle = document.getElementById("teaser-ref-style");
 
   if (!LAST_RESULT || !LAST_RESULT.stitched_image || !LAST_RESULT.stitched_image.url) {
     status.textContent = "Need stitched image first. Generate images above.";
@@ -160,6 +161,7 @@ async function handleGenerateVideo() {
   if (synopsis) sp.set("synopsis", synopsis);
   sp.set("stitched_image_url", stitched);
   sp.set("duration", duration);
+  if (refStyle && refStyle.checked) sp.set("style", "reference");
 
   const url = `/api/video_teaser?${sp.toString()}`;
   btn.disabled = true;
