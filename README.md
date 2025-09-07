@@ -1,4 +1,4 @@
-# Story Spark — Movies First, Storybook Too
+# Story Spark — Movies and Stories
 
 Story Spark is a pair of Flask services and a lightweight UI to help you ideate visual stories fast.
 
