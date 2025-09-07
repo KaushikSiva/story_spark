@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Motion Poster & Story Images</title>
+    <link rel="stylesheet" href="/static/ui/styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Motion Poster & Story Images</h1>
+      <p class="tag">Generate a synopsis or bring your own — get images, a stitched collage, and a first-look poster.</p>
+    </header>
+
+    <main>
+      <section class="card">
+        <form id="gen-form">
+          <div class="grid">
+            <label>
+              <span>Title (optional)</span>
+              <input type="text" name="title" placeholder="Leave blank to auto-generate" />
+            </label>
+
+            <label>
+              <span>Genre (optional)</span>
+              <input type="text" name="genre" list="genre-list" placeholder="Sci‑Fi, Drama, Fantasy..." />
+              <datalist id="genre-list">
+                <option value="Action" />
+                <option value="Drama" />
+                <option value="Sci‑Fi" />
+                <option value="Fantasy" />
+                <option value="Thriller" />
+                <option value="Mystery" />
+                <option value="Horror" />
+                <option value="Adventure" />
+              </datalist>
+            </label>
+
+            <label>
+              <span>Number of parts</span>
+              <select name="n">
+                <option value="8" selected>8</option>
+                <option value="4">4</option>
+                <option value="6">6</option>
+                <option value="9">9</option>
+                <option value="12">12</option>
+              </select>
+            </label>
+
+            <label class="switch">
+              <input type="checkbox" name="generate_images" checked />
+              <span>Generate images</span>
+            </label>
+          </div>
+
+          <label class="block">
+            <span>Synopsis (optional)</span>
+            <textarea name="synopsis" rows="7" placeholder="Leave blank to have the model write a 7–8 line synopsis."></textarea>
+          </label>
+
+          <div class="actions">
+            <button type="submit">Generate</button>
+            <span id="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </section>
+
+      <section id="result" class="card hidden"></section>
+    </main>
+
+    <footer>
+      <small>Powered by your local backend at <code>/api/motion_poster</code></small>
+    </footer>
+
+    <script src="/static/ui/app.js"></script>
+  </body>
+  </html>
+

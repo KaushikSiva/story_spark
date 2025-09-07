@@ -1,0 +1,33 @@
+:root{--bg:#0b0f14;--card:#121821;--muted:#8aa0b2;--text:#e7eef5;--accent:#60a5fa;--pill:#233042;--pill-alt:#2b3b2a}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Cantarell,Noto Sans,sans-serif}
+header,footer{max-width:1100px;margin:20px auto;padding:0 16px}
+header h1{margin:0 0 8px;font-size:22px}header .tag{margin:0;color:var(--muted)}
+main{max-width:1100px;margin:0 auto;padding:0 16px 40px}
+.card{background:var(--card);border-radius:12px;padding:16px 16px;margin:16px 0;box-shadow:0 1px 0 #0008}
+label{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+label span{color:var(--muted);font-size:12px}
+.block textarea{width:100%;background:#0f1620;color:var(--text);border:1px solid #1f2937;border-radius:8px;padding:10px;resize:vertical}
+input[type=text],select{width:100%;background:#0f1620;color:var(--text);border:1px solid #1f2937;border-radius:8px;padding:10px}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+@media (max-width:900px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:560px){.grid{grid-template-columns:1fr}}
+.actions{display:flex;align-items:center;gap:12px;margin-top:10px}
+button{background:var(--accent);color:#06101e;border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}
+#status{color:var(--muted)}
+.hidden{display:none}
+.meta{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.sub{display:flex;gap:8px;flex-wrap:wrap}
+.pill{background:var(--pill);color:#cfe6ff;border-radius:999px;padding:2px 10px;font-size:12px}
+.pill.alt{background:var(--pill-alt);color:#d6f5d6}
+.synopsis p{margin:8px 0}
+.media{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:12px}
+@media (max-width:900px){.media{grid-template-columns:1fr}}
+.media-card{margin:0}
+.media-card img{width:100%;height:auto;border-radius:10px;display:block}
+.media-card figcaption{color:var(--muted);font-size:12px;margin-top:6px}
+.imgs{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media (max-width:900px){.imgs{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:560px){.imgs{grid-template-columns:1fr}}
+.img img{width:100%;height:auto;border-radius:8px;display:block}
+footer small{color:var(--muted)}
+
