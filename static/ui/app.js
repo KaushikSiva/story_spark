@@ -12,6 +12,10 @@ function addCacheBust(url) {
   }
 }
 
+function slugify(s) {
+  return (s || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'untitled';
+}
+
 function qs(params) {
   const sp = new URLSearchParams();
   Object.entries(params).forEach(([k, v]) => {
@@ -155,6 +159,10 @@ window.addEventListener("DOMContentLoaded", () => {
   if (btnClear) btnClear.addEventListener("click", handleClear);
   const btnUpload = document.getElementById("btn-upload-process");
   if (btnUpload) btnUpload.addEventListener("click", handleUploadProcess);
+  const folderEl = document.getElementById('upload-folder');
+  const titleEl = document.querySelector('#gen-form input[name="title"]');
+  if (folderEl) folderEl.addEventListener('input', updateUploadPreview);
+  if (titleEl) titleEl.addEventListener('input', updateUploadPreview);
   // Restore last result on refresh
   try {
     const raw = localStorage.getItem('last_result');
@@ -165,6 +173,8 @@ window.addEventListener("DOMContentLoaded", () => {
       result.classList.remove('hidden');
     }
   } catch {}
+  // Initialize preview
+  updateUploadPreview();
 });
 
 async function handleGenerateVideo() {
@@ -174,20 +184,24 @@ async function handleGenerateVideo() {
   const durSel = document.getElementById("teaser-duration");
   const refStyle = document.getElementById("teaser-ref-style");
   const appendExtras = document.getElementById("teaser-append-extras");
+  const folderInput = document.getElementById("teaser-folder");
 
-  if (!LAST_RESULT || !LAST_RESULT.stitched_image || !LAST_RESULT.stitched_image.url) {
-    status.textContent = "Need stitched image first. Generate images above.";
-    return;
-  }
-
-  const stitched = LAST_RESULT.stitched_image.url;
+  const stitched = (LAST_RESULT && LAST_RESULT.stitched_image && LAST_RESULT.stitched_image.url) || "";
   const synopsis = (LAST_RESULT.synopsis || "").trim();
   const duration = durSel ? durSel.value : "10";
 
   // Build query safely
   const sp = new URLSearchParams();
   if (synopsis) sp.set("synopsis", synopsis);
-  sp.set("stitched_image_url", stitched);
+  if (stitched) sp.set("stitched_image_url", stitched);
+  // Folder inference: prefer explicit input; else last run_dir; else slug from Title
+  const form = document.getElementById('gen-form');
+  let run_dir = folderInput && folderInput.value.trim();
+  if (!run_dir && LAST_RESULT && LAST_RESULT.run_dir) run_dir = LAST_RESULT.run_dir;
+  if (!run_dir && form && form.title && form.title.value.trim()) {
+    run_dir = form.title.value.trim().toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || 'untitled';
+  }
+  if (run_dir) sp.set('run_dir', run_dir);
   sp.set("duration", duration);
   if (refStyle && refStyle.checked) sp.set("style", "reference");
   if (appendExtras && !appendExtras.checked) sp.set("append_extras", "0");
@@ -245,6 +259,7 @@ async function handleUploadProcess() {
   const status = document.getElementById('upload-status');
   const out = document.getElementById('upload-video-out');
   const formEl = document.querySelector('#gen-form');
+  const folderEl = document.getElementById('upload-folder');
   if (!fileInput || !fileInput.files || !fileInput.files[0]) {
     status.textContent = 'Choose a video file first';
     return;
@@ -255,6 +270,9 @@ async function handleUploadProcess() {
   if (formEl && formEl.title && formEl.title.value.trim()) {
     fd.append('title', formEl.title.value.trim());
   }
+  if (folderEl && folderEl.value.trim()) {
+    fd.append('run_dir', folderEl.value.trim());
+  }
   status.textContent = 'Processing…';
   out.classList.add('hidden');
   out.innerHTML = '';
@@ -264,11 +282,48 @@ async function handleUploadProcess() {
     if (!res.ok) throw new Error(data && data.error ? `${data.error}: ${data.details || ''}` : `HTTP ${res.status}`);
     renderVideo(out, data);
     out.classList.remove('hidden');
-    status.textContent = 'Done';
+    status.textContent = data.postprocessed ? 'Done (with end card)' : 'Done';
   } catch (e) {
     console.error(e);
     status.textContent = `Error: ${e.message || e}`;
   }
+}
+
+async function updateUploadPreview() {
+  const info = document.getElementById('upload-preview');
+  if (!info) return;
+  const folderEl = document.getElementById('upload-folder');
+  const titleEl = document.querySelector('#gen-form input[name="title"]');
+  let run_dir = folderEl && folderEl.value.trim();
+  if (!run_dir && titleEl && titleEl.value.trim()) run_dir = slugify(titleEl.value);
+  if (!run_dir && LAST_RESULT && LAST_RESULT.run_dir) run_dir = LAST_RESULT.run_dir;
+  if (!run_dir) {
+    info.textContent = 'Folder not set — will default to "uploads".';
+    return;
+  }
+  const posterJpg = `/static/generated/${run_dir}/first_look.jpg`;
+  const posterPng = `/static/generated/${run_dir}/first_look.png`;
+  const stitched = `/static/generated/${run_dir}/stitched.jpg`;
+  const found = await probeAny([posterJpg, posterPng, stitched]);
+  if (found) {
+    const label = found.includes('first_look') ? 'first_look' : 'stitched.jpg';
+    info.textContent = `Folder: ${run_dir} — using ${label} if present; end card will be added.`;
+  } else {
+    info.textContent = `Folder: ${run_dir} — no poster/stitched found; only end card will be added.`;
+  }
+}
+
+async function probeAny(urls) {
+  for (const u of urls) {
+    try {
+      const res = await fetch(addCacheBust(u), { method: 'HEAD' });
+      if (res.ok) return u;
+      // fallback GET if HEAD blocked
+      const res2 = await fetch(addCacheBust(u), { method: 'GET', cache: 'no-store' });
+      if (res2.ok) return u;
+    } catch {}
+  }
+  return '';
 }
 
 function handleClear() {

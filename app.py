@@ -17,6 +17,8 @@ from services.motion_poster_service import (
 )
 from services.video_teaser_service import generate_video_teaser
 from services.video_teaser_service import append_poster_and_tag
+import sys
+import subprocess
 
 
 load_dotenv()
@@ -70,6 +72,11 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             return app.send_static_file("ui/index.html")
         except Exception:
             return "UI not found. Ensure static/ui/index.html exists.", 404
+
+    # Silence browser favicon requests to avoid noisy 404s in the console
+    @app.route("/favicon.ico", methods=["GET"])  # pragma: no cover
+    def favicon():
+        return ("", 204)
 
     @app.route("/api/motion_poster", methods=["GET", "OPTIONS"])
     def motion_poster():
@@ -216,6 +223,7 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         title = (request.args.get("title") or "").strip() or None
         synopsis = (request.args.get("synopsis") or "").strip() or None
         stitched_image_url = (request.args.get("stitched_image_url") or "").strip() or None
+        run_dir_param = (request.args.get("run_dir") or "").strip() or None
         duration = 8  # enforced by service/model
 
         # Pull from cache if missing
@@ -223,13 +231,53 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         if not synopsis and last_payload:
             synopsis = last_payload.get("synopsis")
             title = title or last_payload.get("title")
-        if not stitched_image_url and last_payload and last_payload.get("stitched_image"):
-            stitched_image_url = last_payload["stitched_image"].get("url")
-
-        if not synopsis:
-            return jsonify({"error": "synopsis parameter is required or call /api/motion_poster first"}), 400
         if not stitched_image_url:
-            return jsonify({"error": "stitched_image_url parameter is required or call /api/motion_poster first"}), 400
+            # Resolve from run_dir/title: prefer stitched, else first_look
+            base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
+            # Determine run_dir in order: param -> last -> slug(title)
+            run_dir = run_dir_param or (last_payload.get("run_dir") if last_payload else None)
+            if not run_dir and title:
+                run_dir = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-") or "untitled"
+            if run_dir:
+                folder = base_out / run_dir
+                if folder.exists():
+                    base_url = request.url_root.rstrip("/")
+                    stitched_path = folder / "stitched.jpg"
+                    first_look_jpg = folder / "first_look.jpg"
+                    first_look_png = folder / "first_look.png"
+                    if stitched_path.exists():
+                        rel = str(stitched_path.relative_to(base_out))
+                        stitched_image_url = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}"
+                    elif first_look_jpg.exists() or first_look_png.exists():
+                        p = first_look_jpg if first_look_jpg.exists() else first_look_png
+                        rel = str(p.relative_to(base_out))
+                        stitched_image_url = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}"
+
+        # If no synopsis at this point, generate a lightweight one
+        if not synopsis:
+            try:
+                res, _src, _err = generate_motion_poster_script(
+                    title=title,
+                    genre=None,
+                    synopsis=None,
+                    seed=None,
+                    base_url=app.config["LLM_BASE_URL"],
+                    model=app.config["LLM_MODEL"],
+                    timeout=app.config["LLM_TIMEOUT_SECONDS"],
+                    api_key=app.config["LLM_API_KEY"],
+                    require_local=False,
+                    api_style=app.config["LLM_API_STYLE"],
+                    chat_path=app.config["LLM_CHAT_PATH"],
+                    completions_path=app.config["LLM_COMPLETIONS_PATH"],
+                )
+                synopsis = res.get("synopsis") or synopsis
+                title = title or res.get("title")
+            except Exception:
+                pass
+        if not synopsis:
+            return jsonify({"error": "synopsis parameter is required", "details": "Unable to infer synopsis"}), 400
+        if not stitched_image_url:
+            return jsonify({"error": "image missing", "details": "Provide stitched_image_url or ensure folder has stitched.jpg or first_look"}), 400
 
         try:
             # Determine output dir based on cached run_dir (title folder); fallback to base
@@ -254,6 +302,9 @@ def create_app(*, enable_veo: bool = False) -> Flask:
             if video_result.get("local_file"):
                 rel = str(Path(video_result["local_file"]).relative_to(app.config["OUTPUT_DIR"]))
                 video_result["url"] = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}"
+            # Surface whether postprocessing ran
+            if "postprocessed" not in video_result:
+                video_result["postprocessed"] = False
             video_result["stitched_image_url"] = stitched_image_url
             return jsonify(video_result)
         except Exception as e:
@@ -338,12 +389,15 @@ def create_app(*, enable_veo: bool = False) -> Flask:
 
         f = request.files["file"]
         title_override = (request.form.get("title") or "").strip() or None
+        run_dir_param = (request.form.get("run_dir") or "").strip() or None
 
         # Determine output dir in title folder if available
         last_payload = getattr(app, "_last_motion_poster_cache", None)
         base_out = Path(app.config.get("OUTPUT_DIR", "static/generated"))
         run_dir = None
-        if title_override:
+        if run_dir_param:
+            run_dir = run_dir_param
+        elif title_override:
             slug = re.sub(r"[^a-z0-9]+", "-", title_override.lower()).strip("-") or "untitled"
             run_dir = slug
         elif last_payload and last_payload.get("run_dir"):
@@ -364,19 +418,60 @@ def create_app(*, enable_veo: bool = False) -> Flask:
         except Exception:
             pass
         f.save(str(upload_path))
+        app.logger.info("postprocess: saved upload to %s", str(upload_path))
 
         try:
             final_path = append_poster_and_tag(str(upload_path), str(out_dir))
+            postprocessed = Path(final_path).exists() and Path(final_path).name == "teaser_with_credits.mp4"
         except Exception as e:
             return jsonify({"error": "postprocess_failed", "details": str(e)}), 500
 
         base_url = request.url_root.rstrip("/")
-        rel = str(Path(final_path).relative_to(app.config["OUTPUT_DIR"]))
+        rel = str(Path(final_path).relative_to(app.config["OUTPUT_DIR"])) if Path(final_path).exists() else str(upload_path.relative_to(app.config["OUTPUT_DIR"]))
+        app.logger.info("postprocess: result postprocessed=%s final=%s", postprocessed, str(final_path))
         return jsonify({
             "url": f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{rel}",
-            "local_file": final_path,
+            "local_file": str(final_path),
             "run_dir": run_dir,
+            "postprocessed": postprocessed,
         })
+
+    @app.route("/api/diag", methods=["GET"])  # pragma: no cover
+    def diag():
+        """Return environment diagnostics to help debug video tooling issues."""
+        info = {}
+        info["python"] = sys.executable
+        info["output_dir"] = app.config.get("OUTPUT_DIR")
+        # Versions and module paths
+        def _ver(modname):
+            try:
+                m = __import__(modname)
+                v = getattr(m, "__version__", "")
+                p = getattr(m, "__file__", "")
+                return {"version": v, "path": p}
+            except Exception as e:
+                return {"error": str(e)}
+        info["moviepy"] = _ver("moviepy")
+        info["PIL"] = _ver("PIL")
+        try:
+            import imageio_ffmpeg  # type: ignore
+            info["imageio_ffmpeg_exe"] = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception as e:
+            info["imageio_ffmpeg_exe"] = {"error": str(e)}
+        # ffmpeg -version
+        try:
+            exe = os.environ.get("IMAGEIO_FFMPEG_EXE") or "ffmpeg"
+            out = subprocess.check_output([exe, "-version"], stderr=subprocess.STDOUT, timeout=5)
+            info["ffmpeg_version"] = out.decode("utf-8", errors="ignore").splitlines()[:2]
+        except Exception as e:
+            info["ffmpeg_version"] = {"error": str(e)}
+        # Optional: folder probe
+        run_dir = (request.args.get("run_dir") or "").strip()
+        if run_dir:
+            folder = Path(app.config.get("OUTPUT_DIR", "static/generated")) / run_dir
+            info["probe_folder"] = str(folder)
+            info["files_present"] = [p.name for p in folder.iterdir()] if folder.exists() else []
+        return jsonify(info)
 
     return app
 
