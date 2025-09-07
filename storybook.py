@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory, redirect
 from dotenv import load_dotenv
 import requests
 
@@ -32,7 +32,7 @@ def create_app() -> Flask:
     log = logging.getLogger(__name__)
 
     app.config.update(
-        OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated"),
+        OUTPUT_DIR=os.environ.get("OUTPUT_DIR", "static/generated/storybook"),
         MODEL=os.environ.get("GENERATION_MODEL", "models/gemini-2.5-flash-image-preview"),
         IMAGE_SIZE=os.environ.get("IMAGE_SIZE", "1024x1024"),
         OUTPUT_TTL_SECONDS=int(os.environ.get("OUTPUT_TTL_SECONDS", str(60 * 60))),
@@ -44,6 +44,9 @@ def create_app() -> Flask:
         LLM_API_STYLE=os.environ.get("LLM_API_STYLE", "auto"),  # auto|chat|completions
         LLM_CHAT_PATH=os.environ.get("LLM_CHAT_PATH", "/chat/completions"),
         LLM_COMPLETIONS_PATH=os.environ.get("LLM_COMPLETIONS_PATH", "/completions"),
+        # Storybook UI (React via Vite) integration
+        STORYBOOK_DIST_DIR=os.environ.get("STORYBOOK_DIST_DIR", "static/ui/story_book/dist"),
+        STORYBOOK_DEV_URL=os.environ.get("STORYBOOK_DEV_URL", "http://localhost:5173"),
     )
 
     Path(app.config["OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
@@ -117,13 +120,19 @@ def create_app() -> Flask:
         base_url = request.url_root.rstrip("/")
         scenes = []
         for idx, scene in enumerate(story):
-            filename = Path(files[idx]).name
-            url = f"{base_url}/{app.static_url_path.lstrip('/')}/generated/{filename}"
+            fpath = Path(files[idx])
+            try:
+                rel_under_static = fpath.relative_to(Path(app.static_folder))
+                rel_url = rel_under_static.as_posix()
+            except Exception:
+                # Fallback to default subfolder path if relative calc fails
+                rel_url = f"generated/storybook/{fpath.name}"
+            url = f"{base_url}/{app.static_url_path.lstrip('/')}/{rel_url}"
             scenes.append({
                 "index": idx + 1,
                 "text": scene["text"],
                 "image_url": url,
-                "filename": filename,
+                "filename": fpath.name,
             })
 
         _schedule_cleanup(files, ttl_seconds)
@@ -140,6 +149,27 @@ def create_app() -> Flask:
         if llm_error:
             resp_payload["llm_error"] = llm_error
         return jsonify(resp_payload)
+
+    # Storybook UI routes: serve built assets if available; otherwise, redirect to dev server
+    @app.route("/storybook")
+    def storybook_ui_root():  # pragma: no cover
+        dist_dir = Path(app.config["STORYBOOK_DIST_DIR"]) 
+        index_file = dist_dir / "index.html"
+        if index_file.exists():
+            return send_from_directory(str(dist_dir), "index.html")
+        # Fallback to dev server if running Vite
+        dev_url = app.config["STORYBOOK_DEV_URL"].rstrip("/")
+        return redirect(f"{dev_url}/", code=302)
+
+    @app.route("/storybook/<path:path>")
+    def storybook_ui_assets(path):  # pragma: no cover
+        dist_dir = Path(app.config["STORYBOOK_DIST_DIR"]) 
+        file_path = dist_dir / path
+        if file_path.exists():
+            return send_from_directory(str(dist_dir), path)
+        # If not built, bounce to dev server path
+        dev_url = app.config["STORYBOOK_DEV_URL"].rstrip("/")
+        return redirect(f"{dev_url}/{path}", code=302)
 
     return app
 
